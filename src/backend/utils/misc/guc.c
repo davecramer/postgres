@@ -12945,7 +12945,7 @@ show_format_binary()
 	int char_length=0;
 
 
-	for (; format_binary[length]!=0; length++)q
+	for (; format_binary[length]!=0; length++)
 	{
 		if ( format_binary[length] < 100)
 		{
