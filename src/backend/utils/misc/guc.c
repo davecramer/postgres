@@ -143,6 +143,7 @@ extern char *temp_tablespaces;
 extern bool ignore_checksum_failure;
 extern bool ignore_invalid_pages;
 extern bool synchronize_seqscans;
+extern Oid  *binary_formats;
 
 #ifdef TRACE_SYNCSCAN
 extern bool trace_syncscan;
@@ -242,6 +243,8 @@ static bool check_recovery_target_lsn(char **newval, void **extra, GucSource sou
 static void assign_recovery_target_lsn(const char *newval, void *extra);
 static bool check_primary_slot_name(char **newval, void **extra, GucSource source);
 static bool check_default_with_oids(bool *newval, void **extra, GucSource source);
+static bool check_format_binary(char **newval, void **extra, GucSource source);
+static void assign_format_binary(const char*newval, void *extra);
 
 /* Private functions in guc-file.l that need to be called from guc.c */
 static ConfigVariable *ProcessConfigFileInternal(GucContext context,
@@ -4295,6 +4298,17 @@ static struct config_string ConfigureNamesString[] =
 		&local_preload_libraries_string,
 		"",
 		NULL, NULL, NULL
+	},
+	{
+		{"format_binary", PGC_USERSET, CLIENT_CONN_STATEMENT,
+			gettext_noop("Sets the type Oid's to be returned in binary format"),
+			gettext_noop("Set by the client to indicate which types are to be "
+						 "returned in binary format. "),
+			GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE
+		},
+		&format_binary,
+		"",
+		check_format_binary, assign_format_binary, NULL
 	},
 
 	{
@@ -12891,5 +12905,47 @@ check_default_with_oids(bool *newval, void **extra, GucSource source)
 
 	return true;
 }
+
+static bool
+check_format_binary( char **newval, void **extra, GucSource source)
+{
+	if (*newval)
+	{
+
+	}
+	return true;
+}
+
+static void
+assign_format_binary(const char *newval, void *extra)
+{
+	char *tmp = palloc(strlen(newval));
+	strcpy(tmp, newval);
+	// unlikely to have more than 16
+	int length = 16;
+	// +1 for the InvalidOid marker at the end
+	Oid *tmpOids = palloc(length+1);
+	int i = 0;
+	if (newval && strcmp(tmp, "") != 0)
+	{
+		char *token = strtok(tmp, ",");
+
+		while(token != NULL)
+		{
+			tmpOids[i++] = atooid(token);
+			if (i > length)
+			{
+				length += 16;
+				tmpOids = repalloc(tmpOids, length+1);
+			}
+			token = strtok(NULL, ",");
+		}
+		tmpOids[i] = InvalidOid;
+		binary_formats = tmpOids;
+
+	}
+}
+
+
 
 #include "guc-file.c"
