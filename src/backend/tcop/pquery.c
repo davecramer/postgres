@@ -58,6 +58,8 @@ static uint64 DoPortalRunFetch(Portal portal,
 							   long count,
 							   DestReceiver *dest);
 static void DoPortalRewind(Portal portal);
+static int findOid( Oid *binary_oids, Oid oid);
+extern Oid  *binary_formats;
 
 
 /*
@@ -644,18 +646,50 @@ PortalSetResultFormat(Portal portal, int nFormats, int16 *formats)
 	}
 	else if (nFormats > 0)
 	{
-		/* single format specified, use for all columns */
-		int16		format1 = formats[0];
+		if ( binary_formats != NULL )
+		{
+			Oid targetOid;
 
-		for (i = 0; i < natts; i++)
-			portal->formats[i] = format1;
+			for (i = 0; i < natts; i++){
+				targetOid = portal->tupDesc->attrs[i].atttypid;
+				portal->formats[i] = findOid(binary_formats, targetOid);
+			}
+		}
+		else
+		{
+			/* single format specified, use for all columns */
+			int16		format1 = formats[0];
+
+			for (i = 0; i < natts; i++)
+				portal->formats[i] = format1;
+		}
 	}
 	else
 	{
-		/* use default format for all columns */
-		for (i = 0; i < natts; i++)
-			portal->formats[i] = 0;
+		if ( binary_formats != NULL )
+		{
+			Oid targetOid;
+
+			for (i = 0; i < natts; i++){
+				targetOid = portal->tupDesc->attrs[i].atttypid;
+				portal->formats[i] = findOid(binary_formats, targetOid);
+			}
+		}
+		else {
+			/* use default format for all columns */
+			for (i = 0; i < natts; i++)
+				portal->formats[i] = 0;
+		}
 	}
+}
+static int findOid( Oid *binary_oids, Oid oid)
+{
+	Oid *tmp = binary_oids;
+	while (*tmp != InvalidOid)
+	{
+		if (*tmp++ == oid) return 1;
+	}
+	return 0;
 }
 
 /*

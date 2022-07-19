@@ -105,6 +105,8 @@ int			PostAuthDelay = 0;
 /* Time between checks that the client is still connected. */
 int			client_connection_check_interval = 0;
 
+Oid			*binary_formats = NULL;
+
 /* ----------------
  *		private typedefs etc
  * ----------------
