@@ -12909,9 +12909,36 @@ check_default_with_oids(bool *newval, void **extra, GucSource source)
 static bool
 check_format_binary( char **newval, void **extra, GucSource source)
 {
-	if (*newval)
-	{
+	// sanity check
+	if (*newval == NULL)
+		return false;
+	
+	if (strcmp(*newval,"") == 0)
+		return true;
 
+	char *tmp = palloc(strlen(*newval));
+	strcpy(tmp, *newval);
+	char *token = strtok(tmp, ",");
+
+	while(token != NULL)
+	{
+		Oid candidate = atooid(token);
+		if (candidate > OID_MAX) 
+			GUC_check_errdetail("OID out of range found in %s, %s", *newval, token);
+
+		// atooid will return 0 aka InvalidOid if it can't convert the string or 0 
+		// if it's really 0	
+		if (candidate == InvalidOid)
+		{	
+			if (errno == EINVAL)
+				GUC_check_errdetail("%s has invalid characters at %s",
+					*newval, token);
+			else
+				GUC_check_errdetail("InvalidOid (0) found in %s", *newval);
+			return false;
+		}
+		else
+			token = strtok(NULL, ",");
 	}
 	return true;
 }
@@ -12919,6 +12946,10 @@ check_format_binary( char **newval, void **extra, GucSource source)
 static void
 assign_format_binary(const char *newval, void *extra)
 {
+	// check for errors or nothing to do
+	if (newval == NULL || strcmp(newval, "") == 0)
+		return;
+
 	char *tmp = palloc(strlen(newval));
 	strcpy(tmp, newval);
 	// unlikely to have more than 16
@@ -12926,24 +12957,22 @@ assign_format_binary(const char *newval, void *extra)
 	// +1 for the InvalidOid marker at the end
 	Oid *tmpOids = palloc(length+1);
 	int i = 0;
-	if (newval && strcmp(tmp, "") != 0)
+	
+	char *token = strtok(tmp, ",");
+
+	while(token != NULL)
 	{
-		char *token = strtok(tmp, ",");
-
-		while(token != NULL)
+		tmpOids[i++] = atooid(token);
+		if (i > length)
 		{
-			tmpOids[i++] = atooid(token);
-			if (i > length)
-			{
-				length += 16;
-				tmpOids = repalloc(tmpOids, length+1);
-			}
-			token = strtok(NULL, ",");
+			length += 16;
+			tmpOids = repalloc(tmpOids, length+1);
 		}
-		tmpOids[i] = InvalidOid;
-		binary_format_oids = tmpOids;
-
+		token = strtok(NULL, ",");
 	}
+	tmpOids[i] = InvalidOid;
+	binary_format_oids = tmpOids;
+
 }
 
 
