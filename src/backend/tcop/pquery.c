@@ -59,7 +59,7 @@ static uint64 DoPortalRunFetch(Portal portal,
 							   DestReceiver *dest);
 static void DoPortalRewind(Portal portal);
 static int findOid( Oid *binary_oids, Oid oid);
-extern Oid  *binary_formats;
+extern Oid  *binary_format_oids;
 
 
 /*
@@ -646,13 +646,14 @@ PortalSetResultFormat(Portal portal, int nFormats, int16 *formats)
 	}
 	else if (nFormats > 0)
 	{
-		if ( binary_formats != NULL )
+		// The client has requested binary formats for some types
+		if ( binary_format_oids != NULL )
 		{
 			Oid targetOid;
 
 			for (i = 0; i < natts; i++){
 				targetOid = portal->tupDesc->attrs[i].atttypid;
-				portal->formats[i] = findOid(binary_formats, targetOid);
+				portal->formats[i] = findOid(binary_format_oids, targetOid);
 			}
 		}
 		else
@@ -666,13 +667,13 @@ PortalSetResultFormat(Portal portal, int nFormats, int16 *formats)
 	}
 	else
 	{
-		if ( binary_formats != NULL )
+		if ( binary_format_oids != NULL )
 		{
 			Oid targetOid;
 
 			for (i = 0; i < natts; i++){
 				targetOid = portal->tupDesc->attrs[i].atttypid;
-				portal->formats[i] = findOid(binary_formats, targetOid);
+				portal->formats[i] = findOid(binary_format_oids, targetOid);
 			}
 		}
 		else {
@@ -682,10 +683,15 @@ PortalSetResultFormat(Portal portal, int nFormats, int16 *formats)
 		}
 	}
 }
+
+/*
+* Linear search through the array of oids.
+* I don't expect this to ever be a large array
+*/
 static int findOid( Oid *binary_oids, Oid oid)
 {
 	Oid *tmp = binary_oids;
-	while (*tmp != InvalidOid)
+	while (tmp && *tmp != InvalidOid)
 	{
 		if (*tmp++ == oid) return 1;
 	}

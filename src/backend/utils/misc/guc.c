@@ -143,7 +143,7 @@ extern char *temp_tablespaces;
 extern bool ignore_checksum_failure;
 extern bool ignore_invalid_pages;
 extern bool synchronize_seqscans;
-extern Oid  *binary_formats;
+extern Oid  *binary_format_oids;
 
 #ifdef TRACE_SYNCSCAN
 extern bool trace_syncscan;
@@ -12941,7 +12941,7 @@ assign_format_binary(const char *newval, void *extra)
 			token = strtok(NULL, ",");
 		}
 		tmpOids[i] = InvalidOid;
-		binary_formats = tmpOids;
+		binary_format_oids = tmpOids;
 
 	}
 }
