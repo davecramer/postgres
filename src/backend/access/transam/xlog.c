@@ -755,6 +755,7 @@ static void WALInsertLockUpdateInsertingAt(XLogRecPtr insertingAt);
  * before the data page can be written out.  This implements the basic
  * WAL rule "write the log before the data".)
  */
+#pragma optimize("",off)
 XLogRecPtr
 XLogInsertRecord(XLogRecData *rdata,
 				 XLogRecPtr fpw_lsn,
@@ -1097,6 +1098,7 @@ XLogInsertRecord(XLogRecData *rdata,
 	return EndPos;
 }
 
+#pragma optimize("",on)
 /*
  * Reserves the right amount of space for a record of given size from the WAL.
  * *StartPos is set to the beginning of the reserved section, *EndPos to
@@ -1378,6 +1380,7 @@ CopyXLogRecordToWAL(int write_len, bool isLogSwitch, XLogRecData *rdata,
 /*
  * Acquire a WAL insertion lock, for inserting to WAL.
  */
+
 static void
 WALInsertLockAcquire(void)
 {

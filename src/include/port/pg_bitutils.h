@@ -293,7 +293,7 @@ pg_ceil_log2_64(uint64 num)
  * Otherwise, we fall back to a hand-rolled implementation.
  */
 #ifdef HAVE_X86_64_POPCNTQ
-#if defined(HAVE__GET_CPUID) || defined(HAVE__CPUID)
+#if defined(_M_ARM64) || defined(HAVE__GET_CPUID) || defined(HAVE__CPUID)
 #define TRY_POPCNT_X86_64 1
 #endif
 #endif
