@@ -2082,6 +2082,77 @@ process_result(PGconn *conn, PGresult *res, int results, int numsent)
 	return got_error;
 }
 
+/*
+ * Test holdable cursors using protocol 3.3 cursor options in Bind message.
+ */
+static void
+test_holdable_cursor(PGconn *conn)
+{
+	PGresult   *res;
+
+	fprintf(stderr, "holdable cursor... ");
+
+	/* Verify protocol 3.3 */
+	if (PQfullProtocolVersion(conn) < 30003)
+		pg_fatal("protocol 3.3 required, got %d", PQfullProtocolVersion(conn));
+
+	/* Start transaction */
+	res = PQexec(conn, "BEGIN");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pg_fatal("BEGIN failed: %s", PQerrorMessage(conn));
+	PQclear(res);
+
+	/* Create test table */
+	res = PQexec(conn, "CREATE TEMP TABLE holdable_test(id int)");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pg_fatal("CREATE TABLE failed: %s", PQerrorMessage(conn));
+	PQclear(res);
+
+	res = PQexec(conn, "INSERT INTO holdable_test VALUES (1), (2), (3)");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pg_fatal("INSERT failed: %s", PQerrorMessage(conn));
+	PQclear(res);
+
+	/* Prepare statement */
+	res = PQprepare(conn, "holdstmt", "SELECT * FROM holdable_test", 0, NULL);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pg_fatal("PREPARE failed: %s", PQerrorMessage(conn));
+	PQclear(res);
+
+	/* Enter pipeline mode */
+	if (PQenterPipelineMode(conn) != 1)
+		pg_fatal("failed to enter pipeline mode: %s", PQerrorMessage(conn));
+
+	/* Use PQsendQueryPreparedWithCursorOptions to create holdable portal */
+	if (PQsendQueryPreparedWithCursorOptions(conn, "holdstmt", 0, NULL, NULL, NULL, 0, "holdportal", 0x0020) != 1)
+		pg_fatal("PQsendQueryPreparedWithCursorOptions failed: %s", PQerrorMessage(conn));
+
+	/* Commit - portal should survive */
+	if (PQsendQueryParams(conn, "COMMIT", 0, NULL, NULL, NULL, NULL, 0) != 1)
+		pg_fatal("COMMIT failed: %s", PQerrorMessage(conn));
+
+	if (PQpipelineSync(conn) != 1)
+		pg_fatal("pipeline sync failed: %s", PQerrorMessage(conn));
+
+	/* Get results */
+	res = confirm_result_status(conn, PGRES_TUPLES_OK);
+	if (PQntuples(res) != 3)
+		pg_fatal("expected 3 rows, got %d", PQntuples(res));
+	PQclear(res);
+	consume_null_result(conn);
+
+	consume_result_status(conn, PGRES_COMMAND_OK);	/* COMMIT */
+	consume_null_result(conn);
+
+	consume_result_status(conn, PGRES_PIPELINE_SYNC);
+	consume_null_result(conn);
+
+	if (PQexitPipelineMode(conn) != 1)
+		pg_fatal("failed to exit pipeline mode: %s", PQerrorMessage(conn));
+
+	fprintf(stderr, "ok\n");
+}
+
 
 static void
 usage(const char *progname)
@@ -2100,6 +2171,7 @@ print_test_list(void)
 {
 	printf("cancel\n");
 	printf("disallowed_in_pipeline\n");
+	printf("holdable_cursor\n");
 	printf("multi_pipelines\n");
 	printf("nosync\n");
 	printf("pipeline_abort\n");
@@ -2207,6 +2279,8 @@ main(int argc, char **argv)
 		test_cancel(conn);
 	else if (strcmp(testname, "disallowed_in_pipeline") == 0)
 		test_disallowed_in_pipeline(conn);
+	else if (strcmp(testname, "holdable_cursor") == 0)
+		test_holdable_cursor(conn);
 	else if (strcmp(testname, "multi_pipelines") == 0)
 		test_multi_pipelines(conn);
 	else if (strcmp(testname, "nosync") == 0)

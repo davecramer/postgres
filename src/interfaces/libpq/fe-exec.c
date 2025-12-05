@@ -1682,6 +1682,116 @@ PQsendQueryPrepared(PGconn *conn,
 						   resultFormat);
 }
 
+int
+PQsendQueryPreparedWithCursorOptions(PGconn *conn,
+									 const char *stmtName,
+									 int nParams,
+									 const char *const *paramValues,
+									 const int *paramLengths,
+									 const int *paramFormats,
+									 int resultFormat,
+									 const char *portalName,
+									 int cursorOptions)
+{
+	PGcmdQueueEntry *entry;
+
+	if (!PQsendQueryStart(conn, true))
+		return 0;
+
+	if (!stmtName)
+	{
+		libpq_append_conn_error(conn, "statement name is a null pointer");
+		return 0;
+	}
+
+	if ((cursorOptions & 0x0020) && (!portalName || portalName[0] == '\0'))
+	{
+		libpq_append_conn_error(conn, "holdable cursors require a named portal");
+		return 0;
+	}
+
+	entry = pqAllocCmdQueueEntry(conn);
+	if (entry == NULL)
+		return 0;
+
+	if (pqPutMsgStart(PqMsg_Bind, conn) < 0 ||
+		pqPuts(portalName ? portalName : "", conn) < 0 ||
+		pqPuts(stmtName, conn) < 0)
+		goto sendFailed;
+
+	if (nParams > 0 && paramFormats)
+	{
+		if (pqPutInt(nParams, 2, conn) < 0)
+			goto sendFailed;
+		for (int i = 0; i < nParams; i++)
+			if (pqPutInt(paramFormats[i], 2, conn) < 0)
+				goto sendFailed;
+	}
+	else if (pqPutInt(0, 2, conn) < 0)
+		goto sendFailed;
+
+	if (pqPutInt(nParams, 2, conn) < 0)
+		goto sendFailed;
+
+	for (int i = 0; i < nParams; i++)
+	{
+		if (paramValues && paramValues[i])
+		{
+			int len = paramLengths ? paramLengths[i] : strlen(paramValues[i]);
+			if (pqPutInt(len, 4, conn) < 0 ||
+				pqPutnchar(paramValues[i], len, conn) < 0)
+				goto sendFailed;
+		}
+		else if (pqPutInt(-1, 4, conn) < 0)
+			goto sendFailed;
+	}
+
+	if (pqPutInt(1, 2, conn) < 0 ||
+		pqPutInt(resultFormat, 2, conn) < 0)
+		goto sendFailed;
+
+	/* Send cursor options if protocol 3.3+ */
+	if (conn->pversion >= PG_PROTOCOL(3, 3))
+	{
+		if (pqPutInt(cursorOptions, 4, conn) < 0)
+			goto sendFailed;
+	}
+
+	if (pqPutMsgEnd(conn) < 0)
+		goto sendFailed;
+
+	if (pqPutMsgStart(PqMsg_Describe, conn) < 0 ||
+		pqPutc('P', conn) < 0 ||
+		pqPuts(portalName ? portalName : "", conn) < 0 ||
+		pqPutMsgEnd(conn) < 0)
+		goto sendFailed;
+
+	if (pqPutMsgStart(PqMsg_Execute, conn) < 0 ||
+		pqPuts(portalName ? portalName : "", conn) < 0 ||
+		pqPutInt(0, 4, conn) < 0 ||
+		pqPutMsgEnd(conn) < 0)
+		goto sendFailed;
+
+	if (conn->pipelineStatus == PQ_PIPELINE_OFF)
+	{
+		if (pqPutMsgStart(PqMsg_Sync, conn) < 0 ||
+			pqPutMsgEnd(conn) < 0)
+			goto sendFailed;
+	}
+
+	entry->queryclass = PGQUERY_EXTENDED;
+
+	if (pqPipelineFlush(conn) < 0)
+		goto sendFailed;
+
+	conn->asyncStatus = PGASYNC_BUSY;
+	return 1;
+
+sendFailed:
+	pqRecycleCmdQueueEntry(conn, entry);
+	return 0;
+}
+
 /*
  * PQsendQueryStart
  *	Common startup code for PQsendQuery and sibling routines

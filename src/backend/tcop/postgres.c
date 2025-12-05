@@ -1636,6 +1636,7 @@ exec_bind_message(StringInfo input_message)
 	int			numParams;
 	int			numRFormats;
 	int16	   *rformats = NULL;
+	int			cursorOptions = 0;
 	CachedPlanSource *psrc;
 	CachedPlan *cplan;
 	Portal		portal;
@@ -2013,6 +2014,12 @@ exec_bind_message(StringInfo input_message)
 			rformats[i] = pq_getmsgint(input_message, 2);
 	}
 
+	/* Get cursor options if present (protocol 3.3+) */
+	if (input_message->cursor < input_message->len)
+	{
+		cursorOptions = pq_getmsgint(input_message, 4);
+		elog(DEBUG1, "exec_bind_message: read cursorOptions=0x%04x from message", cursorOptions);
+	}
 	pq_getmsgend(input_message);
 
 	/*
@@ -2060,6 +2067,26 @@ exec_bind_message(StringInfo input_message)
 	 * Apply the result format requests to the portal.
 	 */
 	PortalSetResultFormat(portal, numRFormats, rformats);
+
+	/* Apply cursor options */
+	if (cursorOptions & CURSOR_OPT_HOLD)
+	{
+		elog(DEBUG1, "exec_bind_message: applying CURSOR_OPT_HOLD to portal '%s'", portal_name);
+
+		if (portal_name[0] == '\0')
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_CURSOR_NAME),
+					 errmsg("holdable cursors require a named portal")));
+		if (InSecurityRestrictedOperation())
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("cannot create cursor WITH HOLD in restricted operation")));
+
+		elog(DEBUG1, "exec_bind_message: CURSOR_OPT_HOLD validation passed for portal '%s'", portal_name);
+	}
+
+	portal->cursorOptions = cursorOptions;
+	elog(DEBUG1, "exec_bind_message: portal '%s' cursorOptions set to 0x%04x", portal_name, cursorOptions);
 
 	/*
 	 * Done binding; remove the parameters error callback.  Entries emitted
@@ -4908,7 +4935,16 @@ PostgresMain(const char *dbname, const char *username)
 
 								portal = GetPortalByName(close_target);
 								if (PortalIsValid(portal))
+								{
+									elog(DEBUG1, "Close message: closing portal '%s' (cursorOptions=0x%04x)",
+										 close_target, portal->cursorOptions);
 									PortalDrop(portal, false);
+									elog(DEBUG1, "Close message: portal '%s' closed successfully", close_target);
+								}
+								else
+								{
+									elog(DEBUG1, "Close message: portal '%s' not found", close_target);
+								}
 							}
 							break;
 						default:

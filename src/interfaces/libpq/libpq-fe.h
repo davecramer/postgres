@@ -525,6 +525,10 @@ extern int	PQsendQueryPrepared(PGconn *conn,
 								const int *paramLengths,
 								const int *paramFormats,
 								int resultFormat);
+extern int	PQsendQueryPreparedWithCursorOptions(PGconn *conn, const char *stmtName,
+								int nParams, const char *const *paramValues,
+								const int *paramLengths, const int *paramFormats,
+								int resultFormat, const char *portalName, int cursorOptions);
 extern int	PQsetSingleRowMode(PGconn *conn);
 extern int	PQsetChunkedRowsMode(PGconn *conn, int chunkSize);
 extern PGresult *PQgetResult(PGconn *conn);
