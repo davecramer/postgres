@@ -2286,18 +2286,82 @@ exec_bind_message(StringInfo input_message)
 }
 
 /*
+ * fetch_count_wire_to_long
+ *
+ * Map the signed Int64 fetch count from the scrollable-Execute wire trailer
+ * onto a platform C long (the type PortalRunFetch expects).  PG_INT64_MAX is
+ * the reserved token meaning "fetch all", which must map to FETCH_ALL
+ * (LONG_MAX) rather than being synthesized by truncation.
+ */
+static long
+fetch_count_wire_to_long(int64 count)
+{
+	/* Reserved token: portable "fetch all". */
+	if (count == PG_INT64_MAX)
+		return FETCH_ALL;		/* == LONG_MAX */
+
+	/*
+	 * The wire count is a full 64-bit int, but "long" is only 32 bits where
+	 * SIZEOF_LONG < 8 (e.g. LLP64 Windows, ILP32 platforms).  There, a value
+	 * that does not fit would be silently truncated by the cast below, so
+	 * reject it instead.  Where "long" is 64-bit, LONG_MAX == PG_INT64_MAX and
+	 * this comparison is always false, so it is compiled out to avoid a
+	 * tautological-comparison warning.
+	 */
+#if SIZEOF_LONG < 8
+	if (count > LONG_MAX || count < LONG_MIN)
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("fetch count out of range for this platform")));
+#endif
+	return (long) count;
+}
+
+/*
+ * fetch_direction_wire_to_enum
+ *
+ * Map the Int32 fetch direction from the scrollable-Execute wire trailer onto
+ * the server's FetchDirection enum.  Keeping the two independent means the enum
+ * can be reordered or extended without breaking the protocol.
+ */
+static FetchDirection
+fetch_direction_wire_to_enum(int wire_direction)
+{
+	switch (wire_direction)
+	{
+		case PQ_CURSOR_FETCH_FORWARD:
+			return FETCH_FORWARD;
+		case PQ_CURSOR_FETCH_BACKWARD:
+			return FETCH_BACKWARD;
+		case PQ_CURSOR_FETCH_ABSOLUTE:
+			return FETCH_ABSOLUTE;
+		case PQ_CURSOR_FETCH_RELATIVE:
+			return FETCH_RELATIVE;
+	}
+
+	ereport(ERROR,
+			(errcode(ERRCODE_PROTOCOL_VIOLATION),
+			 errmsg("invalid fetch direction in Execute message: %d",
+					wire_direction)));
+	return FETCH_FORWARD;		/* keep compiler quiet */
+}
+
+/*
  * exec_execute_message
  *
  * Process an "Execute" message for a portal
  */
 static void
-exec_execute_message(const char *portal_name, long max_rows)
+exec_execute_message(const char *portal_name, long max_rows,
+					 bool is_scroll_execute, int wire_direction,
+					 int64 fetch_count)
 {
 	CommandDest dest;
 	DestReceiver *receiver;
 	Portal		portal;
 	bool		completed;
 	QueryCompletion qc;
+	uint64		nprocessed;
 	const char *sourceText;
 	const char *prepStmtName;
 	ParamListInfo portalParams;
@@ -2460,12 +2524,53 @@ exec_execute_message(const char *portal_name, long max_rows)
 	if (max_rows <= 0)
 		max_rows = FETCH_ALL;
 
-	completed = PortalRun(portal,
-						  max_rows,
-						  true, /* always top level */
-						  receiver,
-						  receiver,
-						  &qc);
+	if (is_scroll_execute)
+	{
+		FetchDirection direction;
+		long		count;
+
+		/* Map the wire direction onto the server's FetchDirection enum. */
+		direction = fetch_direction_wire_to_enum(wire_direction);
+
+		/* A scrollable Execute requires a fetchable portal. */
+		if (portal->strategy != PORTAL_ONE_SELECT &&
+			portal->strategy != PORTAL_ONE_RETURNING &&
+			portal->strategy != PORTAL_ONE_MOD_WITH &&
+			portal->strategy != PORTAL_UTIL_SELECT)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot scroll a portal of this type")));
+
+		/* Map Int64 wire count onto platform long. */
+		count = fetch_count_wire_to_long(fetch_count);
+
+		nprocessed = PortalRunFetch(portal, direction, count, receiver);
+
+		/*
+		 * Build the completion tag preserving the query's verb.  Unlike a
+		 * SQL-level FETCH (which reports CMDTAG_FETCH), the protocol-level
+		 * scrollable Execute must report the original query's command tag so
+		 * the wire result stays compatible with what a plain Execute returns.
+		 */
+		InitializeQueryCompletion(&qc);
+		if (portal->qc.commandTag != CMDTAG_UNKNOWN)
+		{
+			CopyQueryCompletion(&qc, &portal->qc);
+			qc.nprocessed = nprocessed;
+		}
+
+		/* A fetch always completes — it never reports PortalSuspended. */
+		completed = true;
+	}
+	else
+	{
+		completed = PortalRun(portal,
+							  max_rows,
+							  true, /* always top level */
+							  receiver,
+							  receiver,
+							  &qc);
+	}
 
 	receiver->rDestroy(receiver);
 
@@ -5143,6 +5248,9 @@ PostgresMain(const char *dbname, const char *username)
 				{
 					const char *portal_name;
 					int			max_rows;
+					int			wire_direction = PQ_CURSOR_FETCH_FORWARD;
+					int64		fetch_count = 0;
+					bool		is_scroll_execute = false;
 
 					forbidden_in_wal_sender(firstchar);
 
@@ -5151,9 +5259,31 @@ PostgresMain(const char *dbname, const char *username)
 
 					portal_name = pq_getmsgstring(&input_message);
 					max_rows = pq_getmsgint(&input_message, 4);
+
+					/*
+					 * Optional scrollable-execute trailer, present only when
+					 * the _pq_.protocol_cursor extension has been negotiated.
+					 * Any trailing bytes without the extension are a protocol
+					 * violation.
+					 */
+					if (input_message.cursor < input_message.len)
+					{
+						if (MyProcPort == NULL ||
+							!MyProcPort->protocol_cursor_enabled)
+							ereport(ERROR,
+									(errcode(ERRCODE_PROTOCOL_VIOLATION),
+									 errmsg("invalid Execute message"),
+									 errdetail("Trailing data in an Execute message requires the \"_pq_.protocol_cursor\" protocol extension.")));
+
+						wire_direction = pq_getmsgint(&input_message, 4);
+						fetch_count = pq_getmsgint64(&input_message);
+						is_scroll_execute = true;
+					}
 					pq_getmsgend(&input_message);
 
-					exec_execute_message(portal_name, max_rows);
+					exec_execute_message(portal_name, max_rows,
+										 is_scroll_execute, wire_direction,
+										 fetch_count);
 
 					/* exec_execute_message does valgrind_report_error_query */
 				}

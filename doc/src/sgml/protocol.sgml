@@ -338,12 +338,17 @@
       <entry><literal>_pq_.protocol_cursor</literal></entry>
       <entry><literal>true</literal></entry>
       <entry>PostgreSQL 20 and later</entry>
-      <entry>Enables cursor options in the Bind message.
+      <entry>Enables cursor options in the Bind message and scrollable
+        Execute.
         When set to <literal>true</literal>, the Bind message includes
         an optional bitmap field carrying the cursor options for the
         portal: <literal>1</literal> (<literal>WITH HOLD</literal>),
         <literal>2</literal> (<literal>SCROLL</literal>) and
         <literal>4</literal> (<literal>NO SCROLL</literal>).
+        In addition, the Execute message may include an optional
+        fetch direction and count trailer, allowing a portal to be
+        scrolled in either direction; see the Execute message format
+        for details.
       </entry>
       </row>
      </tbody>
@@ -5186,7 +5191,67 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
         <para>
          Maximum number of rows to return, if portal contains
          a query that returns rows (ignored otherwise).  Zero
-         denotes <quote>no limit</quote>.
+         denotes <quote>no limit</quote>.  This field is ignored
+         when the optional fetch direction and count trailer
+         described below is present.
+        </para>
+       </listitem>
+      </varlistentry>
+     </variablelist>
+
+     <para>
+      When the <literal>_pq_.protocol_cursor</literal> protocol extension
+      has been negotiated, the following two additional fields may
+      optionally appear after the fields above.  They must appear together
+      (both fields present, or neither); a partial trailer is a protocol
+      error.  A client that does not negotiate the extension must not send
+      these fields.  When the trailer is present, the portal is scrolled
+      according to the given direction and count, and the maximum-row-count
+      field above is ignored.
+     </para>
+
+     <para>
+      Fetching backwards, or by absolute position, requires the portal to have
+      been created with the <literal>SCROLL</literal> cursor option in its Bind
+      message; otherwise the server reports the error
+      <literal>cursor can only scan forward</literal>.
+     </para>
+
+     <variablelist>
+      <varlistentry>
+       <term>Int32 (optional)</term>
+       <listitem>
+        <para>
+         The fetch direction.  One of the following values:
+         <literal>0</literal> (<literal>FORWARD</literal>),
+         <literal>1</literal> (<literal>BACKWARD</literal>),
+         <literal>2</literal> (<literal>ABSOLUTE</literal>), or
+         <literal>3</literal> (<literal>RELATIVE</literal>).
+        </para>
+       </listitem>
+      </varlistentry>
+
+      <varlistentry>
+       <term>Int64 (optional)</term>
+       <listitem>
+        <para>
+         The fetch count, interpreted according to the fetch direction,
+         following the semantics of the SQL <command>FETCH</command>
+         command.  This is a signed 64-bit integer.
+         With <literal>FORWARD</literal> or <literal>BACKWARD</literal>,
+         <productname>PostgreSQL</productname>'s largest positive 64-bit
+         integer value is reserved as a sentinel meaning
+         <quote>all remaining rows in that direction</quote> (equivalent to
+         <command>FETCH ALL</command> and
+         <command>FETCH BACKWARD ALL</command>); it is a portable spelling of
+         that request, since the equivalent internal value is platform
+         dependent.  With <literal>ABSOLUTE</literal> or
+         <literal>RELATIVE</literal> the value is a literal row position or
+         offset, and this sentinel has no special meaning: it addresses a
+         position past the end of any result set and so returns no rows.
+         A count of <literal>0</literal>
+         re-fetches the most recently fetched row without moving the portal's
+         position, exactly as <command>FETCH FORWARD 0</command> does.
         </para>
        </listitem>
       </varlistentry>

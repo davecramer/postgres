@@ -153,17 +153,24 @@ typedef uint32 AuthRequest;		/* an AUTH_REQ_* code */
 
 /*
  * Wire values for the _pq_.protocol_cursor extension: the cursor-option bitmap
- * carried by the optional Int32 trailer of the Bind message.
+ * carried by the optional Int32 trailer of the Bind message, and the fetch
+ * direction carried by the optional trailer of the Execute message.
  *
  * These are protocol constants.  They intentionally do not track the
- * server-internal CURSOR_OPT_* constants (parsenodes.h), so that those can be
- * reordered or extended freely.  The client-side names in libpq-fe.h
- * (PQ_BIND_CURSOR_*) must carry the same values.
+ * server-internal CURSOR_OPT_* constants (parsenodes.h) or the FetchDirection
+ * enum, so that those can be reordered or extended freely.  The client-side
+ * names in libpq-fe.h (PQ_BIND_CURSOR_*, PQ_FETCH_*) must carry the same
+ * values.
  */
 #define PQ_CURSOR_FLAG_HOLD			0x0001
 #define PQ_CURSOR_FLAG_SCROLL		0x0002
 #define PQ_CURSOR_FLAG_NO_SCROLL	0x0004
 #define PQ_CURSOR_FLAG_ALL			0x0007
+
+#define PQ_CURSOR_FETCH_FORWARD		0
+#define PQ_CURSOR_FETCH_BACKWARD	1
+#define PQ_CURSOR_FETCH_ABSOLUTE	2
+#define PQ_CURSOR_FETCH_RELATIVE	3
 
 
 /*
