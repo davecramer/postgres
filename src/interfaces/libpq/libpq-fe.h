@@ -70,6 +70,16 @@ extern "C"
 #define LIBPQ_HAS_OAUTH_BEARER_TOKEN_V2 1
 
 /*
+ * Bind message extension flags.  These flags are sent in the optional
+ * extension bitmap field of the Bind message when a protocol extension
+ * is negotiated.  Future extensions may define additional bits.
+ */
+
+/* Flags for the _pq_.protocol_cursor extension */
+#define PQ_BIND_CURSOR_HOLD			0x0001	/* WITH HOLD */
+#define PQ_BIND_CURSOR_VALID_FLAGS	(PQ_BIND_CURSOR_HOLD)
+
+/*
  * Option flags for PQcopyResult
  */
 #define PG_COPYRES_ATTRS		  0x01
@@ -542,6 +552,11 @@ extern int	PQsendQueryPrepared(PGconn *conn,
 								const int *paramLengths,
 								const int *paramFormats,
 								int resultFormat);
+extern int	PQsendBindWithCursorOptions(PGconn *conn, const char *stmtName,
+										int nParams, const char *const *paramValues,
+										const int *paramLengths, const int *paramFormats,
+										int resultFormat, const char *portalName, int cursorOptions);
+extern int	PQPortalCursorEnabled(const PGconn *conn);
 extern int	PQsetSingleRowMode(PGconn *conn);
 extern int	PQsetChunkedRowsMode(PGconn *conn, int chunkSize);
 extern PGresult *PQgetResult(PGconn *conn);

@@ -152,6 +152,19 @@ typedef uint32 AuthRequest;		/* an AUTH_REQ_* code */
 
 
 /*
+ * Wire values for the _pq_.protocol_cursor extension: the cursor-option bitmap
+ * carried by the optional Int32 trailer of the Bind message.
+ *
+ * These are protocol constants.  They intentionally do not track the
+ * server-internal CURSOR_OPT_* constants (parsenodes.h), so that those can be
+ * reordered or extended freely.  The client-side names in libpq-fe.h
+ * (PQ_BIND_CURSOR_*) must carry the same values.
+ */
+#define PQ_CURSOR_FLAG_HOLD			0x0001
+#define PQ_CURSOR_FLAG_ALL			0x0001
+
+
+/*
  * The packet used with a CANCEL_REQUEST_CODE.
  *
  * Before PostgreSQL v18 and the protocol version bump from 3.0 to 3.2, the

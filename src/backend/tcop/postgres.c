@@ -1654,6 +1654,59 @@ exec_parse_message(const char *query_string,	/* string to execute */
 }
 
 /*
+ * apply_bind_cursor_options
+ *
+ * Apply the cursor options requested by a Bind message (already mapped to
+ * CURSOR_OPT_* values) to a portal whose query has been defined but not yet
+ * started.  Rejects combinations the portal machinery cannot honor, mirroring
+ * the checks transformDeclareCursorStmt() and PerformCursorOpen() apply to
+ * DECLARE CURSOR.
+ *
+ * Must be called after PortalDefineQuery() --- the plan is needed --- and
+ * before PortalStart().
+ */
+static void
+apply_bind_cursor_options(Portal portal, int cursor_options)
+{
+	/* No flags requested: keep the defaults CreatePortal() installed. */
+	if (cursor_options == 0)
+		return;
+
+	if (cursor_options & CURSOR_OPT_HOLD)
+	{
+		PlannedStmt *pstmt;
+
+		/*
+		 * A holdable portal requires a live QueryDesc: PortalStart() only
+		 * builds one for PORTAL_ONE_SELECT, and PersistHoldablePortal()
+		 * dereferences it unconditionally.  That is also the only strategy
+		 * DECLARE CURSOR can produce.
+		 */
+		if (ChoosePortalStrategy(portal->stmts) != PORTAL_ONE_SELECT)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot use cursor options with this query"),
+					 errdetail("Holdable portals are supported only for a single SELECT statement.")));
+
+		/* PORTAL_ONE_SELECT implies a single non-utility PlannedStmt. */
+		pstmt = linitial_node(PlannedStmt, portal->stmts);
+
+		if (pstmt->rowMarks != NIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot create a holdable portal for a query with a row locking clause"),
+					 errdetail("Holdable cursors must be READ ONLY.")));
+	}
+
+	/*
+	 * CreatePortal() defaults to CURSOR_OPT_NO_SCROLL, and nothing here
+	 * changes that: requesting HOLD alone must not quietly make a portal
+	 * backward-fetchable.
+	 */
+	portal->cursorOptions |= cursor_options;
+}
+
+/*
  * exec_bind_message
  *
  * Process a "Bind" message to create a portal from a prepared statement
@@ -1668,6 +1721,7 @@ exec_bind_message(StringInfo input_message)
 	int			numParams;
 	int			numRFormats;
 	int16	   *rformats = NULL;
+	int			bind_cursor_options = 0;
 	CachedPlanSource *psrc;
 	CachedPlan *cplan;
 	Portal		portal;
@@ -2044,6 +2098,34 @@ exec_bind_message(StringInfo input_message)
 			rformats[i] = pq_getmsgint(input_message, 2);
 	}
 
+	/*
+	 * Get bind cursor-option flags if present (_pq_.protocol_cursor enabled).
+	 *
+	 * The wire-level flag values (PQ_CURSOR_FLAG_*) are defined independently
+	 * of the server-internal CURSOR_OPT_* constants in parsenodes.h, so we
+	 * must map between the two representations here.  The flags are not
+	 * applied to the portal yet: HOLD depends on the portal strategy, which
+	 * is not known until the plan has been obtained.  See
+	 * apply_bind_cursor_options().
+	 */
+	if (MyProcPort != NULL && MyProcPort->protocol_cursor_enabled &&
+		input_message->cursor < input_message->len)
+	{
+		int			bind_ext_flags;
+
+		bind_ext_flags = pq_getmsgint(input_message, 4);
+
+		/* Reject any bits we don't recognize */
+		if (bind_ext_flags & ~PQ_CURSOR_FLAG_ALL)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROTOCOL_VIOLATION),
+					 errmsg("unrecognized cursor option flags in Bind message: 0x%x",
+							bind_ext_flags & ~PQ_CURSOR_FLAG_ALL)));
+
+		/* Map protocol flags to internal CURSOR_OPT_* values */
+		if (bind_ext_flags & PQ_CURSOR_FLAG_HOLD)
+			bind_cursor_options |= CURSOR_OPT_HOLD;
+	}
 	pq_getmsgend(input_message);
 
 	/*
@@ -2077,6 +2159,14 @@ exec_bind_message(StringInfo input_message)
 			break;
 		}
 	}
+
+	/*
+	 * Apply any cursor options the Bind message requested.  This has to
+	 * happen after the portal's query is defined (the plan and the strategy
+	 * are needed) and before PortalStart(), which reads
+	 * portal->cursorOptions.
+	 */
+	apply_bind_cursor_options(portal, bind_cursor_options);
 
 	/* Done with the snapshot used for parameter I/O and parsing/planning */
 	if (snapshot_set)
