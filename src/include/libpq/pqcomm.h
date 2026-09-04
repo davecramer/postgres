@@ -161,7 +161,9 @@ typedef uint32 AuthRequest;		/* an AUTH_REQ_* code */
  * (PQ_BIND_CURSOR_*) must carry the same values.
  */
 #define PQ_CURSOR_FLAG_HOLD			0x0001
-#define PQ_CURSOR_FLAG_ALL			0x0001
+#define PQ_CURSOR_FLAG_SCROLL		0x0002
+#define PQ_CURSOR_FLAG_NO_SCROLL	0x0004
+#define PQ_CURSOR_FLAG_ALL			0x0007
 
 
 /*

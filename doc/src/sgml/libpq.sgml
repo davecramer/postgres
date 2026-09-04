@@ -3176,9 +3176,9 @@ int PQPortalCursorEnabled(const PGconn *conn);
 
       <para>
        When this returns true, <xref linkend="libpq-PQsendBindWithCursorOptions"/>
-       can be used with non-zero cursor options to create holdable portals.
-       Applications can use this function to implement graceful fallback logic
-       when the server does not support the extension.
+       can be used with non-zero cursor options to create scrollable or
+       holdable portals.  Applications can use this function to implement
+       graceful fallback logic when the server does not support the extension.
       </para>
      </listitem>
     </varlistentry>
@@ -5598,18 +5598,35 @@ int PQsendBindWithCursorOptions(PGconn *conn,
 
       <para>
        The <literal>cursorOptions</literal> parameter is a bitmask of
-       cursor option flags.  At present the only flag is
-       <literal>PQ_BIND_CURSOR_HOLD</literal>, which corresponds to the
-       <literal>WITH HOLD</literal> option of
+       cursor option flags:
+       <literal>PQ_BIND_CURSOR_SCROLL</literal>,
+       <literal>PQ_BIND_CURSOR_NO_SCROLL</literal> and
+       <literal>PQ_BIND_CURSOR_HOLD</literal>, which correspond to the
+       <literal>SCROLL</literal>, <literal>NO SCROLL</literal> and
+       <literal>WITH HOLD</literal> options of
        <xref linkend="sql-declare"/>.  No other bits may be set.
       </para>
 
       <para>
-       <literal>PQ_BIND_CURSOR_HOLD</literal> requires the prepared statement
-       to be a single <command>SELECT</command> without a row-locking clause,
-       the same restrictions <xref linkend="sql-declare"/> imposes.  For any
-       other statement the server reports an error rather than silently
-       ignoring the options.
+       <literal>PQ_BIND_CURSOR_SCROLL</literal> and
+       <literal>PQ_BIND_CURSOR_NO_SCROLL</literal> are mutually exclusive;
+       specifying both makes the function return 0 without contacting the
+       server.
+      </para>
+
+      <para>
+       <literal>PQ_BIND_CURSOR_SCROLL</literal> and
+       <literal>PQ_BIND_CURSOR_HOLD</literal> require the prepared statement to
+       be a single <command>SELECT</command> without a row-locking clause, the
+       same restrictions <xref linkend="sql-declare"/> imposes.  For any other
+       statement the server reports an error rather than silently ignoring the
+       options.
+      </para>
+
+      <para>
+       A portal created with <literal>PQ_BIND_CURSOR_SCROLL</literal> may be
+       fetched backwards or by absolute position; one created without it may
+       not, exactly as for <command>DECLARE ... SCROLL CURSOR</command>.
       </para>
 
       <para>

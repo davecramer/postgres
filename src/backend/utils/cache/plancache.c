@@ -99,7 +99,8 @@ static List *RevalidateCachedQuery(CachedPlanSource *plansource,
 								   QueryEnvironment *queryEnv);
 static bool CheckCachedPlan(CachedPlanSource *plansource);
 static CachedPlan *BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
-								   ParamListInfo boundParams, QueryEnvironment *queryEnv);
+								   ParamListInfo boundParams, QueryEnvironment *queryEnv,
+								   int extra_cursor_options);
 static bool choose_custom_plan(CachedPlanSource *plansource,
 							   ParamListInfo boundParams);
 static double cached_plan_cost(CachedPlan *plan, bool include_planner);
@@ -1037,13 +1038,18 @@ CheckCachedPlan(CachedPlanSource *plansource)
  * each parameter value; otherwise the planner will treat the value as a
  * hint rather than a hard constant.
  *
+ * extra_cursor_options is OR'd into the plansource's cursor_options for this
+ * plan only; see GetCachedPlanExtraOptions.  Pass zero for a plan that is
+ * interchangeable with the plansource's other plans.
+ *
  * Planning work is done in the caller's memory context.  The finished plan
  * is in a child memory context, which typically should get reparented
  * (unless this is a one-shot plan, in which case we don't copy the plan).
  */
 static CachedPlan *
 BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
-				ParamListInfo boundParams, QueryEnvironment *queryEnv)
+				ParamListInfo boundParams, QueryEnvironment *queryEnv,
+				int extra_cursor_options)
 {
 	CachedPlan *plan;
 	List	   *plist;
@@ -1095,10 +1101,14 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 	}
 
 	/*
-	 * Generate the plan.
+	 * Generate the plan.  extra_cursor_options is supplied by the caller for
+	 * plans that must satisfy a per-execution requirement not recorded in the
+	 * CachedPlanSource, currently only CURSOR_OPT_SCROLL; such plans are never
+	 * saved as the generic plan (see GetCachedPlanExtraOptions).
 	 */
 	plist = pg_plan_queries(qlist, plansource->query_string,
-							plansource->cursor_options, boundParams);
+							plansource->cursor_options | extra_cursor_options,
+							boundParams);
 
 	/* Release snapshot if we got one */
 	if (snapshot_set)
@@ -1306,6 +1316,30 @@ CachedPlan *
 GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 			  ResourceOwner owner, QueryEnvironment *queryEnv)
 {
+	return GetCachedPlanExtraOptions(plansource, boundParams, owner, queryEnv,
+									 0);
+}
+
+/*
+ * GetCachedPlanExtraOptions: GetCachedPlan with extra planner cursor options.
+ *
+ * extra_cursor_options is OR'd into the plansource's cursor_options while
+ * planning.  This is for requirements that belong to one execution of the
+ * statement rather than to the statement itself: currently only
+ * CURSOR_OPT_SCROLL, which makes the planner produce a plan that can be scanned
+ * backwards (see standard_planner).
+ *
+ * A plan built this way is not interchangeable with the plansource's other
+ * plans, so it is always built as a custom plan and is never installed as the
+ * plansource's generic plan.  Passing zero is exactly equivalent to
+ * GetCachedPlan.
+ */
+CachedPlan *
+GetCachedPlanExtraOptions(CachedPlanSource *plansource,
+						  ParamListInfo boundParams,
+						  ResourceOwner owner, QueryEnvironment *queryEnv,
+						  int extra_cursor_options)
+{
 	CachedPlan *plan = NULL;
 	List	   *qlist;
 	bool		customplan;
@@ -1321,8 +1355,15 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 	/* Make sure the querytree list is valid and we have parse-time locks */
 	qlist = RevalidateCachedQuery(plansource, queryEnv);
 
-	/* Decide whether to use a custom plan */
-	customplan = choose_custom_plan(plansource, boundParams);
+	/*
+	 * Decide whether to use a custom plan.  A plan built with extra cursor
+	 * options is not interchangeable with the plans this CachedPlanSource
+	 * caches, so it must always be a custom plan.
+	 */
+	if (extra_cursor_options != 0)
+		customplan = true;
+	else
+		customplan = choose_custom_plan(plansource, boundParams);
 
 	if (!customplan)
 	{
@@ -1335,7 +1376,7 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 		else
 		{
 			/* Build a new generic plan */
-			plan = BuildCachedPlan(plansource, qlist, NULL, queryEnv);
+			plan = BuildCachedPlan(plansource, qlist, NULL, queryEnv, 0);
 			/* Just make real sure plansource->gplan is clear */
 			ReleaseGenericPlan(plansource);
 			/* Link the new generic plan into the plansource */
@@ -1380,11 +1421,21 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 	if (customplan)
 	{
 		/* Build a custom plan */
-		plan = BuildCachedPlan(plansource, qlist, boundParams, queryEnv);
-		/* Accumulate total costs of custom plans */
-		plansource->total_custom_cost += cached_plan_cost(plan, true);
+		plan = BuildCachedPlan(plansource, qlist, boundParams, queryEnv,
+							   extra_cursor_options);
 
-		plansource->num_custom_plans++;
+		/*
+		 * Accumulate total costs of custom plans.  A plan built with extra
+		 * cursor options is left out of these averages: it may carry a Material
+		 * node that an ordinary plan for this statement would not have, and it
+		 * was not chosen on cost grounds in the first place.
+		 */
+		if (extra_cursor_options == 0)
+		{
+			plansource->total_custom_cost += cached_plan_cost(plan, true);
+
+			plansource->num_custom_plans++;
+		}
 	}
 	else
 	{

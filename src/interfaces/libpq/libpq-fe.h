@@ -77,7 +77,11 @@ extern "C"
 
 /* Flags for the _pq_.protocol_cursor extension */
 #define PQ_BIND_CURSOR_HOLD			0x0001	/* WITH HOLD */
-#define PQ_BIND_CURSOR_VALID_FLAGS	(PQ_BIND_CURSOR_HOLD)
+#define PQ_BIND_CURSOR_SCROLL		0x0002	/* SCROLL */
+#define PQ_BIND_CURSOR_NO_SCROLL	0x0004	/* NO SCROLL */
+#define PQ_BIND_CURSOR_VALID_FLAGS	(PQ_BIND_CURSOR_HOLD | \
+									 PQ_BIND_CURSOR_SCROLL | \
+									 PQ_BIND_CURSOR_NO_SCROLL)
 
 /*
  * Option flags for PQcopyResult

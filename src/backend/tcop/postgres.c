@@ -41,6 +41,7 @@
 #include "commands/prepare.h"
 #include "commands/repack.h"
 #include "common/pg_prng.h"
+#include "executor/executor.h"
 #include "jit/jit.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
@@ -1663,7 +1664,8 @@ exec_parse_message(const char *query_string,	/* string to execute */
  * DECLARE CURSOR.
  *
  * Must be called after PortalDefineQuery() --- the plan is needed --- and
- * before PortalStart().
+ * before PortalStart(), which consumes portal->cursorOptions to decide whether
+ * to start the executor with EXEC_FLAG_BACKWARD.
  */
 static void
 apply_bind_cursor_options(Portal portal, int cursor_options)
@@ -1672,37 +1674,58 @@ apply_bind_cursor_options(Portal portal, int cursor_options)
 	if (cursor_options == 0)
 		return;
 
-	if (cursor_options & CURSOR_OPT_HOLD)
+	if (cursor_options & (CURSOR_OPT_SCROLL | CURSOR_OPT_HOLD))
 	{
 		PlannedStmt *pstmt;
 
 		/*
-		 * A holdable portal requires a live QueryDesc: PortalStart() only
-		 * builds one for PORTAL_ONE_SELECT, and PersistHoldablePortal()
-		 * dereferences it unconditionally.  That is also the only strategy
-		 * DECLARE CURSOR can produce.
+		 * Both options require a live QueryDesc: PortalStart() only builds one
+		 * for PORTAL_ONE_SELECT, and PersistHoldablePortal() dereferences it
+		 * unconditionally.  That is also the only strategy DECLARE CURSOR can
+		 * produce.
 		 */
 		if (ChoosePortalStrategy(portal->stmts) != PORTAL_ONE_SELECT)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("cannot use cursor options with this query"),
-					 errdetail("Holdable portals are supported only for a single SELECT statement.")));
+					 errdetail("Scrollable and holdable portals are supported only for a single SELECT statement.")));
 
 		/* PORTAL_ONE_SELECT implies a single non-utility PlannedStmt. */
 		pstmt = linitial_node(PlannedStmt, portal->stmts);
 
 		if (pstmt->rowMarks != NIL)
+		{
+			if (cursor_options & CURSOR_OPT_SCROLL)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot create a scrollable portal for a query with a row locking clause"),
+						 errdetail("Scrollable cursors must be READ ONLY.")));
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("cannot create a holdable portal for a query with a row locking clause"),
 					 errdetail("Holdable cursors must be READ ONLY.")));
+		}
+
+		/*
+		 * Can't happen: exec_bind_message() plans a scrollable portal with
+		 * CURSOR_OPT_SCROLL, so the planner has already materialized the top
+		 * plan at need.  Check anyway rather than let the executor be started
+		 * with EXEC_FLAG_BACKWARD over a plan that cannot honor it.
+		 */
+		if ((cursor_options & CURSOR_OPT_SCROLL) &&
+			!ExecSupportsBackwardScan(pstmt->planTree))
+			elog(ERROR, "portal plan does not support backward scan");
 	}
 
 	/*
-	 * CreatePortal() defaults to CURSOR_OPT_NO_SCROLL, and nothing here
-	 * changes that: requesting HOLD alone must not quietly make a portal
+	 * CreatePortal() defaults to CURSOR_OPT_NO_SCROLL.  An explicit SCROLL
+	 * request replaces that default; anything else is merely added, so that (for
+	 * example) requesting HOLD alone does not quietly make a portal
 	 * backward-fetchable.
 	 */
+	if (cursor_options & CURSOR_OPT_SCROLL)
+		portal->cursorOptions &= ~CURSOR_OPT_NO_SCROLL;
+
 	portal->cursorOptions |= cursor_options;
 }
 
@@ -1722,6 +1745,7 @@ exec_bind_message(StringInfo input_message)
 	int			numRFormats;
 	int16	   *rformats = NULL;
 	int			bind_cursor_options = 0;
+	int			plan_cursor_options = 0;
 	CachedPlanSource *psrc;
 	CachedPlan *cplan;
 	Portal		portal;
@@ -2104,9 +2128,9 @@ exec_bind_message(StringInfo input_message)
 	 * The wire-level flag values (PQ_CURSOR_FLAG_*) are defined independently
 	 * of the server-internal CURSOR_OPT_* constants in parsenodes.h, so we
 	 * must map between the two representations here.  The flags are not applied
-	 * to the portal yet: HOLD depends on the portal strategy, which is not
-	 * known until the plan has been obtained.  See
-	 * apply_bind_cursor_options().
+	 * to the portal yet: SCROLL is a planner input, and both SCROLL and HOLD
+	 * depend on the portal strategy, neither of which is known until the plan
+	 * has been obtained.  See apply_bind_cursor_options().
 	 */
 	if (MyProcPort != NULL && MyProcPort->protocol_cursor_enabled &&
 		input_message->cursor < input_message->len)
@@ -2123,17 +2147,47 @@ exec_bind_message(StringInfo input_message)
 							bind_ext_flags & ~PQ_CURSOR_FLAG_ALL)));
 
 		/* Map protocol flags to internal CURSOR_OPT_* values */
+		if (bind_ext_flags & PQ_CURSOR_FLAG_SCROLL)
+			bind_cursor_options |= CURSOR_OPT_SCROLL;
+		if (bind_ext_flags & PQ_CURSOR_FLAG_NO_SCROLL)
+			bind_cursor_options |= CURSOR_OPT_NO_SCROLL;
 		if (bind_ext_flags & PQ_CURSOR_FLAG_HOLD)
 			bind_cursor_options |= CURSOR_OPT_HOLD;
+
+		/* Mirrors transformDeclareCursorStmt(); see analyze.c */
+		if ((bind_cursor_options & CURSOR_OPT_SCROLL) &&
+			(bind_cursor_options & CURSOR_OPT_NO_SCROLL))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_CURSOR_DEFINITION),
+			/* translator: %s is a SQL keyword */
+					 errmsg("cannot specify both %s and %s",
+							"SCROLL", "NO SCROLL")));
 	}
 	pq_getmsgend(input_message);
+
+	/*
+	 * If the client asked for a scrollable portal, the plan must be built with
+	 * CURSOR_OPT_SCROLL so that the planner adds a Material node when the top
+	 * plan cannot be scanned backwards; PortalStart() will pass
+	 * EXEC_FLAG_BACKWARD to the executor for such a portal.  This is the same
+	 * contract PerformCursorOpen() gets by passing the DECLARE CURSOR options
+	 * to pg_plan_query().
+	 *
+	 * Only SELECTs are worth planning this way: no other command tag can
+	 * produce a PORTAL_ONE_SELECT portal, and apply_bind_cursor_options()
+	 * rejects everything else below.
+	 */
+	if ((bind_cursor_options & CURSOR_OPT_SCROLL) &&
+		psrc->commandTag == CMDTAG_SELECT)
+		plan_cursor_options = CURSOR_OPT_SCROLL;
 
 	/*
 	 * Obtain a plan from the CachedPlanSource.  Any cruft from (re)planning
 	 * will be generated in MessageContext.  The plan refcount will be
 	 * assigned to the Portal, so it will be released at portal destruction.
 	 */
-	cplan = GetCachedPlan(psrc, params, NULL, NULL);
+	cplan = GetCachedPlanExtraOptions(psrc, params, NULL, NULL,
+									  plan_cursor_options);
 
 	/*
 	 * Now we can define the portal.

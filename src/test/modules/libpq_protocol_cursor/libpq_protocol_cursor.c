@@ -276,6 +276,61 @@ prepare_ok_impl(int line, PGconn *conn, const char *name, const char *query)
 }
 
 /*
+ * Render a result as "<n> rows: v1 v2 ..." so that two results can be
+ * compared with strcmp().
+ */
+static void
+format_result(PGresult *res, char *buf, size_t buflen)
+{
+	snprintf(buf, buflen, "%d rows:", PQntuples(res));
+
+	for (int i = 0; i < PQntuples(res); i++)
+	{
+		for (int j = 0; j < PQnfields(res); j++)
+		{
+			char		val[64];
+
+			snprintf(val, sizeof(val), " %s",
+					 PQgetisnull(res, i, j) ? "NULL" : PQgetvalue(res, i, j));
+			strlcat(buf, val, buflen);
+		}
+	}
+}
+
+/*
+ * Run the same FETCH against a SQL-level cursor and a protocol-level portal
+ * and require identical results.  Both must succeed: an error on either side
+ * aborts the transaction and would make every later comparison agree
+ * vacuously.
+ */
+#define compare_fetch(conn, verb, refname, portalname) \
+	compare_fetch_impl(__LINE__, conn, verb, refname, portalname)
+static void
+compare_fetch_impl(int line, PGconn *conn, const char *verb,
+				   const char *refname, const char *portalname)
+{
+	char		sql[128];
+	char		refbuf[1024];
+	char		portalbuf[1024];
+	PGresult   *res;
+
+	snprintf(sql, sizeof(sql), "%s FROM %s", verb, refname);
+	res = exec_expect_impl(line, conn, sql, PGRES_TUPLES_OK);
+	format_result(res, refbuf, sizeof(refbuf));
+	PQclear(res);
+
+	snprintf(sql, sizeof(sql), "%s FROM %s", verb, portalname);
+	res = exec_expect_impl(line, conn, sql, PGRES_TUPLES_OK);
+	format_result(res, portalbuf, sizeof(portalbuf));
+	PQclear(res);
+
+	if (strcmp(refbuf, portalbuf) != 0)
+		pg_fatal_impl(line,
+					  "\"%s\": SQL cursor returned [%s] but portal returned [%s]",
+					  verb, refbuf, portalbuf);
+}
+
+/*
  * Test holdable cursor: create a portal with PQ_BIND_CURSOR_HOLD via Bind,
  * commit the transaction, then FETCH from the surviving portal.
  */
@@ -357,6 +412,291 @@ test_holdable_cursor(PGconn *conn)
 }
 
 /*
+ * Test scroll cursor: create a portal with PQ_BIND_CURSOR_SCROLL and verify
+ * backward fetching works.
+ */
+static void
+test_scroll_cursor(PGconn *conn)
+{
+	PGresult   *res;
+
+	fprintf(stderr, "test_scroll_cursor... ");
+
+	res = PQexec(conn, "BEGIN");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pg_fatal("BEGIN failed: %s", PQerrorMessage(conn));
+	PQclear(res);
+
+	res = PQexec(conn, "CREATE TEMP TABLE IF NOT EXISTS scroll_test(id int)");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pg_fatal("CREATE TABLE failed: %s", PQerrorMessage(conn));
+	PQclear(res);
+
+	res = PQexec(conn, "INSERT INTO scroll_test VALUES (1), (2), (3)");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pg_fatal("INSERT failed: %s", PQerrorMessage(conn));
+	PQclear(res);
+
+	res = PQprepare(conn, "scrollstmt", "SELECT * FROM scroll_test ORDER BY id", 0, NULL);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pg_fatal("PREPARE failed: %s", PQerrorMessage(conn));
+	PQclear(res);
+
+	if (PQenterPipelineMode(conn) != 1)
+		pg_fatal("failed to enter pipeline mode: %s", PQerrorMessage(conn));
+
+	if (PQsendBindWithCursorOptions(conn, "scrollstmt", 0, NULL, NULL, NULL, 0,
+									"scrollportal", PQ_BIND_CURSOR_SCROLL) != 1)
+		pg_fatal("PQsendBindWithCursorOptions failed: %s", PQerrorMessage(conn));
+
+	/* Fetch forward then backward */
+	if (PQsendQueryParams(conn, "FETCH 2 FROM scrollportal", 0, NULL, NULL, NULL, NULL, 0) != 1)
+		pg_fatal("FETCH forward failed: %s", PQerrorMessage(conn));
+
+	if (PQsendQueryParams(conn, "FETCH BACKWARD 1 FROM scrollportal", 0, NULL, NULL, NULL, NULL, 0) != 1)
+		pg_fatal("FETCH backward failed: %s", PQerrorMessage(conn));
+
+	if (PQsendClosePortal(conn, "scrollportal") != 1)
+		pg_fatal("PQsendClosePortal failed: %s", PQerrorMessage(conn));
+
+	if (PQsendQueryParams(conn, "COMMIT", 0, NULL, NULL, NULL, NULL, 0) != 1)
+		pg_fatal("COMMIT failed: %s", PQerrorMessage(conn));
+
+	if (PQpipelineSync(conn) != 1)
+		pg_fatal("pipeline sync failed: %s", PQerrorMessage(conn));
+
+	/* Bind+Describe result (RowDescription metadata) */
+	res = confirm_result_status(conn, PGRES_COMMAND_OK);
+	if (PQnfields(res) != 1)
+		pg_fatal("expected 1 field, got %d", PQnfields(res));
+	PQclear(res);
+	consume_null_result(conn);
+
+	/* FETCH forward 2 */
+	res = confirm_result_status(conn, PGRES_TUPLES_OK);
+	if (PQntuples(res) != 2)
+		pg_fatal("expected 2 rows from forward fetch, got %d", PQntuples(res));
+	PQclear(res);
+	consume_null_result(conn);
+
+	/* FETCH backward 1 - should get row with id=1 */
+	res = confirm_result_status(conn, PGRES_TUPLES_OK);
+	if (PQntuples(res) != 1)
+		pg_fatal("expected 1 row from backward fetch, got %d", PQntuples(res));
+	if (strcmp(PQgetvalue(res, 0, 0), "1") != 0)
+		pg_fatal("expected value '1' from backward fetch, got '%s'", PQgetvalue(res, 0, 0));
+	PQclear(res);
+	consume_null_result(conn);
+
+	/* CLOSE */
+	consume_result_status(conn, PGRES_COMMAND_OK);
+	consume_null_result(conn);
+
+	/* COMMIT */
+	consume_result_status(conn, PGRES_COMMAND_OK);
+	consume_null_result(conn);
+
+	consume_result_status(conn, PGRES_PIPELINE_SYNC);
+	consume_null_result(conn);
+
+	if (PQexitPipelineMode(conn) != 1)
+		pg_fatal("failed to exit pipeline mode: %s", PQerrorMessage(conn));
+
+	fprintf(stderr, "ok\n");
+}
+
+/*
+ * Test no-scroll cursor: create a portal with PQ_BIND_CURSOR_NO_SCROLL and
+ * verify backward fetching is rejected.
+ */
+static void
+test_no_scroll_cursor(PGconn *conn)
+{
+	PGresult   *res;
+
+	fprintf(stderr, "test_no_scroll_cursor... ");
+
+	res = PQexec(conn, "BEGIN");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pg_fatal("BEGIN failed: %s", PQerrorMessage(conn));
+	PQclear(res);
+
+	res = PQexec(conn, "CREATE TEMP TABLE IF NOT EXISTS noscroll_test(id int)");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pg_fatal("CREATE TABLE failed: %s", PQerrorMessage(conn));
+	PQclear(res);
+
+	res = PQexec(conn, "INSERT INTO noscroll_test VALUES (1), (2), (3)");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pg_fatal("INSERT failed: %s", PQerrorMessage(conn));
+	PQclear(res);
+
+	res = PQprepare(conn, "noscrollstmt", "SELECT * FROM noscroll_test ORDER BY id", 0, NULL);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pg_fatal("PREPARE failed: %s", PQerrorMessage(conn));
+	PQclear(res);
+
+	if (PQenterPipelineMode(conn) != 1)
+		pg_fatal("failed to enter pipeline mode: %s", PQerrorMessage(conn));
+
+	if (PQsendBindWithCursorOptions(conn, "noscrollstmt", 0, NULL, NULL, NULL, 0,
+									"noscrollportal", PQ_BIND_CURSOR_NO_SCROLL) != 1)
+		pg_fatal("PQsendBindWithCursorOptions failed: %s", PQerrorMessage(conn));
+
+	/* Forward fetch should work */
+	if (PQsendQueryParams(conn, "FETCH 1 FROM noscrollportal", 0, NULL, NULL, NULL, NULL, 0) != 1)
+		pg_fatal("FETCH forward failed: %s", PQerrorMessage(conn));
+
+	/* Backward fetch should fail */
+	if (PQsendQueryParams(conn, "FETCH BACKWARD 1 FROM noscrollportal", 0, NULL, NULL, NULL, NULL, 0) != 1)
+		pg_fatal("FETCH backward send failed: %s", PQerrorMessage(conn));
+
+	if (PQsendClosePortal(conn, "noscrollportal") != 1)
+		pg_fatal("PQsendClosePortal failed: %s", PQerrorMessage(conn));
+
+	if (PQpipelineSync(conn) != 1)
+		pg_fatal("pipeline sync failed: %s", PQerrorMessage(conn));
+
+	/* Bind+Describe result (RowDescription metadata) */
+	res = confirm_result_status(conn, PGRES_COMMAND_OK);
+	if (PQnfields(res) != 1)
+		pg_fatal("expected 1 field, got %d", PQnfields(res));
+	PQclear(res);
+	consume_null_result(conn);
+
+	/* FETCH forward 1 - should succeed */
+	res = confirm_result_status(conn, PGRES_TUPLES_OK);
+	if (PQntuples(res) != 1)
+		pg_fatal("expected 1 row from forward fetch, got %d", PQntuples(res));
+	PQclear(res);
+	consume_null_result(conn);
+
+	/* FETCH backward - should fail */
+	consume_result_status(conn, PGRES_FATAL_ERROR);
+	consume_null_result(conn);
+
+	/* CLOSE - pipeline is aborted after the error */
+	consume_result_status(conn, PGRES_PIPELINE_ABORTED);
+	consume_null_result(conn);
+
+	/* Pipeline sync resets the abort state */
+	consume_result_status(conn, PGRES_PIPELINE_SYNC);
+	consume_null_result(conn);
+
+	if (PQexitPipelineMode(conn) != 1)
+		pg_fatal("failed to exit pipeline mode: %s", PQerrorMessage(conn));
+
+	/* Clean up: rollback the failed transaction */
+	res = PQexec(conn, "ROLLBACK");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pg_fatal("ROLLBACK failed: %s", PQerrorMessage(conn));
+	PQclear(res);
+
+	fprintf(stderr, "ok\n");
+}
+
+/*
+ * Test combined cursor options: create a holdable + scrollable portal,
+ * commit the transaction, then fetch backward from the surviving portal.
+ */
+static void
+test_holdable_scroll_cursor(PGconn *conn)
+{
+	PGresult   *res;
+
+	fprintf(stderr, "test_holdable_scroll_cursor... ");
+
+	res = PQexec(conn, "BEGIN");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pg_fatal("BEGIN failed: %s", PQerrorMessage(conn));
+	PQclear(res);
+
+	res = PQexec(conn, "CREATE TEMP TABLE IF NOT EXISTS holdscroll_test(id int)");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pg_fatal("CREATE TABLE failed: %s", PQerrorMessage(conn));
+	PQclear(res);
+
+	res = PQexec(conn, "INSERT INTO holdscroll_test VALUES (1), (2), (3)");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pg_fatal("INSERT failed: %s", PQerrorMessage(conn));
+	PQclear(res);
+
+	res = PQprepare(conn, "holdscrollstmt",
+					"SELECT * FROM holdscroll_test ORDER BY id", 0, NULL);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pg_fatal("PREPARE failed: %s", PQerrorMessage(conn));
+	PQclear(res);
+
+	if (PQenterPipelineMode(conn) != 1)
+		pg_fatal("failed to enter pipeline mode: %s", PQerrorMessage(conn));
+
+	/* Combine HOLD and SCROLL options */
+	if (PQsendBindWithCursorOptions(conn, "holdscrollstmt", 0, NULL, NULL, NULL, 0,
+									"holdscrollportal",
+									PQ_BIND_CURSOR_HOLD | PQ_BIND_CURSOR_SCROLL) != 1)
+		pg_fatal("PQsendBindWithCursorOptions failed: %s", PQerrorMessage(conn));
+
+	if (PQsendQueryParams(conn, "COMMIT", 0, NULL, NULL, NULL, NULL, 0) != 1)
+		pg_fatal("COMMIT failed: %s", PQerrorMessage(conn));
+
+	/* Fetch forward after commit — holdable keeps the portal alive */
+	if (PQsendQueryParams(conn, "FETCH 2 FROM holdscrollportal",
+						  0, NULL, NULL, NULL, NULL, 0) != 1)
+		pg_fatal("FETCH forward failed: %s", PQerrorMessage(conn));
+
+	/* Fetch backward — scroll option allows this */
+	if (PQsendQueryParams(conn, "FETCH BACKWARD 1 FROM holdscrollportal",
+						  0, NULL, NULL, NULL, NULL, 0) != 1)
+		pg_fatal("FETCH backward failed: %s", PQerrorMessage(conn));
+
+	if (PQsendClosePortal(conn, "holdscrollportal") != 1)
+		pg_fatal("PQsendClosePortal failed: %s", PQerrorMessage(conn));
+
+	if (PQpipelineSync(conn) != 1)
+		pg_fatal("pipeline sync failed: %s", PQerrorMessage(conn));
+
+	/* Bind+Describe result (RowDescription metadata) */
+	res = confirm_result_status(conn, PGRES_COMMAND_OK);
+	if (PQnfields(res) != 1)
+		pg_fatal("expected 1 field, got %d", PQnfields(res));
+	PQclear(res);
+	consume_null_result(conn);
+
+	/* COMMIT */
+	consume_result_status(conn, PGRES_COMMAND_OK);
+	consume_null_result(conn);
+
+	/* FETCH forward 2 */
+	res = confirm_result_status(conn, PGRES_TUPLES_OK);
+	if (PQntuples(res) != 2)
+		pg_fatal("expected 2 rows from forward fetch, got %d", PQntuples(res));
+	PQclear(res);
+	consume_null_result(conn);
+
+	/* FETCH backward 1 — should get row with id=1 */
+	res = confirm_result_status(conn, PGRES_TUPLES_OK);
+	if (PQntuples(res) != 1)
+		pg_fatal("expected 1 row from backward fetch, got %d", PQntuples(res));
+	if (strcmp(PQgetvalue(res, 0, 0), "1") != 0)
+		pg_fatal("expected value '1' from backward fetch, got '%s'",
+				 PQgetvalue(res, 0, 0));
+	PQclear(res);
+	consume_null_result(conn);
+
+	/* CLOSE */
+	consume_result_status(conn, PGRES_COMMAND_OK);
+	consume_null_result(conn);
+
+	consume_result_status(conn, PGRES_PIPELINE_SYNC);
+	consume_null_result(conn);
+
+	if (PQexitPipelineMode(conn) != 1)
+		pg_fatal("failed to exit pipeline mode: %s", PQerrorMessage(conn));
+
+	fprintf(stderr, "ok\n");
+}
+
+/*
  * Test that cursor options on a DML statement are rejected.  Such a portal is
  * not PORTAL_ONE_SELECT, so the options cannot be honored; the server must say
  * so rather than accept them and ignore them.
@@ -371,10 +711,10 @@ test_dml_cursor_options_rejected(PGconn *conn)
 	exec_ok(conn, "CREATE TEMP TABLE dml_test(id int)");
 	prepare_ok(conn, "dmlstmt", "INSERT INTO dml_test VALUES (1), (2), (3)");
 
-	/* HOLD on a DML statement cannot be honored and must be rejected */
-	bind_cursor_error(conn, "dmlstmt", "dmlportal", PQ_BIND_CURSOR_HOLD,
+	/* SCROLL on a DML statement cannot be honored and must be rejected */
+	bind_cursor_error(conn, "dmlstmt", "dmlportal", PQ_BIND_CURSOR_SCROLL,
 					  "0A000",
-					  "Holdable portals are supported only for a single SELECT statement.");
+					  "Scrollable and holdable portals are supported only for a single SELECT statement.");
 
 	/* Verify the INSERT didn't execute */
 	res = exec_expect(conn, "SELECT count(*) FROM dml_test", PGRES_TUPLES_OK);
@@ -503,9 +843,9 @@ test_invalid_flags_rejected(PGconn *conn)
 	if (PQenterPipelineMode(conn) != 1)
 		pg_fatal("failed to enter pipeline mode: %s", PQerrorMessage(conn));
 
-	/* Flag 0x0002 is not a valid bind extension flag */
+	/* Flag 0x0008 is not a valid bind extension flag */
 	if (PQsendBindWithCursorOptions(conn, "invalidstmt", 0, NULL, NULL, NULL, 0,
-									"invalidportal", 0x0002) != 0)
+									"invalidportal", 0x0008) != 0)
 		pg_fatal("expected PQsendBindWithCursorOptions to reject invalid flags");
 
 	/* Combination of valid and invalid flags should also be rejected */
@@ -536,9 +876,9 @@ static const char *const non_select_statements[] = {
 };
 
 /*
- * Common body of the test below: request the given cursor options for a portal
- * over each statement above and require the server to reject the Bind, both
- * when the transaction is then rolled back and when it is committed.
+ * Common body of the two tests below: request the given cursor options for a
+ * portal over each statement above and require the server to reject the Bind,
+ * both when the transaction is then rolled back and when it is committed.
  *
  * The commit is the point of the test.  A holdable portal over one of these
  * statements used to reach PreCommit_Portals() with no QueryDesc and take the
@@ -563,13 +903,13 @@ cursor_options_on_non_select(PGconn *conn, int flags)
 		/* First, roll back after the rejected Bind */
 		exec_ok(conn, "BEGIN");
 		bind_cursor_error(conn, stmtname, portalname, flags, "0A000",
-						  "Holdable portals are supported only for a single SELECT statement.");
+						  "Scrollable and holdable portals are supported only for a single SELECT statement.");
 		exec_ok(conn, "ROLLBACK");
 
 		/* Then, commit after it: the sequence that used to crash */
 		exec_ok(conn, "BEGIN");
 		bind_cursor_error(conn, stmtname, portalname, flags, "0A000",
-						  "Holdable portals are supported only for a single SELECT statement.");
+						  "Scrollable and holdable portals are supported only for a single SELECT statement.");
 		exec_ok(conn, "COMMIT");
 
 		if (PQstatus(conn) != CONNECTION_OK)
@@ -601,9 +941,86 @@ test_hold_on_non_select_rejected(PGconn *conn)
 }
 
 /*
- * Test that PQ_BIND_CURSOR_HOLD does not make a portal scrollable: the portal
- * keeps the NO_SCROLL default a DECLARE CURSOR without SCROLL has, both inside
- * the transaction and after the commit that persists it.
+ * Same for PQ_BIND_CURSOR_SCROLL.
+ */
+static void
+test_scroll_on_non_select_rejected(PGconn *conn)
+{
+	fprintf(stderr, "test_scroll_on_non_select_rejected... ");
+	cursor_options_on_non_select(conn, PQ_BIND_CURSOR_SCROLL);
+	fprintf(stderr, "ok\n");
+}
+
+/*
+ * Queries whose top plan node does not support backward scan, so that a
+ * scrollable portal over them is only correct if the planner was told about
+ * SCROLL and inserted a Material node.
+ */
+static const char *const scroll_queries[] = {
+	"SELECT id FROM scrollcmp_test ORDER BY id",	/* Sort */
+	"SELECT id, count(*) FROM scrollcmp_test GROUP BY id",	/* HashAgg */
+	"SELECT DISTINCT id FROM scrollcmp_test",	/* HashAggregate/Unique */
+	"SELECT 1",					/* Result */
+	"SELECT id FROM scrollcmp_test UNION ALL SELECT id FROM scrollcmp_test",	/* Append */
+	"SELECT id FROM scrollcmp_test" /* Seq Scan */
+};
+
+/*
+ * The forward FETCH has to come first: a portal sitting at the start treats a
+ * backward fetch as a no-op, which hides a wrong answer.
+ */
+static const char *const fetch_script[] = {
+	"FETCH 2",
+	"FETCH BACKWARD 1",
+	"FETCH ABSOLUTE 1",
+	"FETCH RELATIVE 2",
+	"FETCH BACKWARD ALL"
+};
+
+/*
+ * Test that a portal bound with PQ_BIND_CURSOR_SCROLL answers a fetch script
+ * exactly as the equivalent DECLARE ... SCROLL CURSOR does.
+ */
+static void
+test_scroll_backward_matches_sql_cursor(PGconn *conn)
+{
+	fprintf(stderr, "test_scroll_backward_matches_sql_cursor... ");
+
+	setup_table(conn, "scrollcmp_test");
+
+	for (int i = 0; i < lengthof(scroll_queries); i++)
+	{
+		char		stmtname[32];
+		char		portalname[32];
+		char		refname[32];
+		char		sql[256];
+
+		snprintf(stmtname, sizeof(stmtname), "scmpstmt%d", i);
+		snprintf(portalname, sizeof(portalname), "scmpportal%d", i);
+		snprintf(refname, sizeof(refname), "scmpref%d", i);
+
+		exec_ok(conn, "BEGIN");
+
+		snprintf(sql, sizeof(sql), "DECLARE %s SCROLL CURSOR FOR %s",
+				 refname, scroll_queries[i]);
+		exec_ok(conn, sql);
+
+		prepare_ok(conn, stmtname, scroll_queries[i]);
+		bind_cursor_ok(conn, stmtname, portalname, PQ_BIND_CURSOR_SCROLL);
+
+		for (int j = 0; j < lengthof(fetch_script); j++)
+			compare_fetch(conn, fetch_script[j], refname, portalname);
+
+		exec_ok(conn, "ROLLBACK");
+	}
+
+	fprintf(stderr, "ok\n");
+}
+
+/*
+ * Test that PQ_BIND_CURSOR_HOLD by itself does not make a portal scrollable:
+ * the portal keeps the NO_SCROLL default a DECLARE CURSOR without SCROLL has,
+ * both inside the transaction and after the commit that persists it.
  */
 static void
 test_hold_only_keeps_no_scroll(PGconn *conn)
@@ -657,8 +1074,44 @@ test_hold_only_keeps_no_scroll(PGconn *conn)
 }
 
 /*
- * Test that a query with a row locking clause is rejected for HOLD, with the
- * same errdetail DECLARE CURSOR uses.
+ * Test that SCROLL and NO SCROLL together are rejected client-side, without a
+ * round trip.
+ */
+static void
+test_scroll_and_no_scroll_rejected(PGconn *conn)
+{
+	const char *errmsg;
+
+	fprintf(stderr, "test_scroll_and_no_scroll_rejected... ");
+
+	prepare_ok(conn, "bothstmt", "SELECT 1");
+
+	if (PQenterPipelineMode(conn) != 1)
+		pg_fatal("failed to enter pipeline mode: %s", PQerrorMessage(conn));
+
+	if (PQsendBindWithCursorOptions(conn, "bothstmt", 0, NULL, NULL, NULL, 0,
+									"bothportal",
+									PQ_BIND_CURSOR_SCROLL |
+									PQ_BIND_CURSOR_NO_SCROLL) != 0)
+		pg_fatal("expected PQsendBindWithCursorOptions to reject SCROLL with NO SCROLL");
+
+	errmsg = PQerrorMessage(conn);
+	if (strstr(errmsg, "PQ_BIND_CURSOR_SCROLL") == NULL ||
+		strstr(errmsg, "PQ_BIND_CURSOR_NO_SCROLL") == NULL)
+		pg_fatal("unexpected error message: %s", errmsg);
+
+	if (PQexitPipelineMode(conn) != 1)
+		pg_fatal("failed to exit pipeline mode: %s", PQerrorMessage(conn));
+
+	/* Nothing was sent, so the connection is still usable */
+	PQclear(exec_expect(conn, "SELECT 1", PGRES_TUPLES_OK));
+
+	fprintf(stderr, "ok\n");
+}
+
+/*
+ * Test that a query with a row locking clause is rejected for both SCROLL and
+ * HOLD, with the same errdetail DECLARE CURSOR uses.
  */
 static void
 test_locking_clause_rejected(PGconn *conn)
@@ -669,9 +1122,64 @@ test_locking_clause_rejected(PGconn *conn)
 	prepare_ok(conn, "lockstmt", "SELECT id FROM locking_test FOR UPDATE");
 
 	exec_ok(conn, "BEGIN");
-	bind_cursor_error(conn, "lockstmt", "lockportal", PQ_BIND_CURSOR_HOLD,
+	bind_cursor_error(conn, "lockstmt", "lockportal1", PQ_BIND_CURSOR_SCROLL,
+					  "0A000", "Scrollable cursors must be READ ONLY.");
+	exec_ok(conn, "ROLLBACK");
+
+	exec_ok(conn, "BEGIN");
+	bind_cursor_error(conn, "lockstmt", "lockportal2", PQ_BIND_CURSOR_HOLD,
 					  "0A000", "Holdable cursors must be READ ONLY.");
 	exec_ok(conn, "ROLLBACK");
+
+	fprintf(stderr, "ok\n");
+}
+
+/*
+ * Test that planning a portal with SCROLL does not leave the resulting plan in
+ * the plan cache for other Binds of the same prepared statement, and that a
+ * cached non-scrollable generic plan is not reused for a scrollable portal.
+ *
+ * The two Binds alternate more times than the plan cache's custom-plan
+ * threshold, so a generic plan is built along the way if one is going to be.
+ */
+static void
+test_scroll_does_not_poison_plan_cache(PGconn *conn)
+{
+	fprintf(stderr, "test_scroll_does_not_poison_plan_cache... ");
+
+	setup_table(conn, "plancache_test");
+	prepare_ok(conn, "pcstmt",
+			   "SELECT id, count(*) FROM plancache_test GROUP BY id");
+
+	for (int i = 0; i < 7; i++)
+	{
+		PGresult   *res;
+
+		/* Without cursor options the portal must refuse to scroll back */
+		exec_ok(conn, "BEGIN");
+		bind_cursor_ok(conn, "pcstmt", "pcportal", 0);
+
+		res = exec_expect(conn, "FETCH 2 FROM pcportal", PGRES_TUPLES_OK);
+		if (PQntuples(res) != 2)
+			pg_fatal("iteration %d: expected 2 rows, got %d", i,
+					 PQntuples(res));
+		PQclear(res);
+
+		exec_expect_error(conn, "FETCH BACKWARD 1 FROM pcportal", "55000",
+						  "cursor can only scan forward");
+		exec_ok(conn, "ROLLBACK");
+
+		/* With SCROLL it must agree with the SQL cursor */
+		exec_ok(conn, "BEGIN");
+		exec_ok(conn, "DECLARE pcref SCROLL CURSOR FOR "
+				"SELECT id, count(*) FROM plancache_test GROUP BY id");
+		bind_cursor_ok(conn, "pcstmt", "pcportal", PQ_BIND_CURSOR_SCROLL);
+
+		for (int j = 0; j < lengthof(fetch_script); j++)
+			compare_fetch(conn, fetch_script[j], "pcref", "pcportal");
+
+		exec_ok(conn, "ROLLBACK");
+	}
 
 	fprintf(stderr, "ok\n");
 }
@@ -719,12 +1227,19 @@ static void
 print_test_list(void)
 {
 	printf("holdable_cursor\n");
+	printf("scroll_cursor\n");
+	printf("no_scroll_cursor\n");
+	printf("holdable_scroll_cursor\n");
+	printf("scroll_backward_matches_sql_cursor\n");
 	printf("hold_only_keeps_no_scroll\n");
+	printf("scroll_does_not_poison_plan_cache\n");
 	printf("dml_cursor_options_rejected\n");
 	printf("hold_on_non_select_rejected\n");
+	printf("scroll_on_non_select_rejected\n");
 	printf("locking_clause_rejected\n");
 	printf("unnamed_portal_rejected\n");
 	printf("invalid_flags_rejected\n");
+	printf("scroll_and_no_scroll_rejected\n");
 	printf("bind_param_limits\n");
 	printf("cursor_options_without_extension\n");
 }
@@ -777,12 +1292,26 @@ main(int argc, char **argv)
 		test_hold_on_non_select_rejected(conn);
 	else if (strcmp(testname, "hold_only_keeps_no_scroll") == 0)
 		test_hold_only_keeps_no_scroll(conn);
+	else if (strcmp(testname, "holdable_scroll_cursor") == 0)
+		test_holdable_scroll_cursor(conn);
 	else if (strcmp(testname, "holdable_cursor") == 0)
 		test_holdable_cursor(conn);
 	else if (strcmp(testname, "invalid_flags_rejected") == 0)
 		test_invalid_flags_rejected(conn);
 	else if (strcmp(testname, "locking_clause_rejected") == 0)
 		test_locking_clause_rejected(conn);
+	else if (strcmp(testname, "no_scroll_cursor") == 0)
+		test_no_scroll_cursor(conn);
+	else if (strcmp(testname, "scroll_and_no_scroll_rejected") == 0)
+		test_scroll_and_no_scroll_rejected(conn);
+	else if (strcmp(testname, "scroll_backward_matches_sql_cursor") == 0)
+		test_scroll_backward_matches_sql_cursor(conn);
+	else if (strcmp(testname, "scroll_cursor") == 0)
+		test_scroll_cursor(conn);
+	else if (strcmp(testname, "scroll_does_not_poison_plan_cache") == 0)
+		test_scroll_does_not_poison_plan_cache(conn);
+	else if (strcmp(testname, "scroll_on_non_select_rejected") == 0)
+		test_scroll_on_non_select_rejected(conn);
 	else if (strcmp(testname, "unnamed_portal_rejected") == 0)
 		test_unnamed_portal_rejected(conn);
 	else

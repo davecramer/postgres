@@ -341,7 +341,9 @@
       <entry>Enables cursor options in the Bind message.
         When set to <literal>true</literal>, the Bind message includes
         an optional bitmap field carrying the cursor options for the
-        portal: <literal>1</literal> (<literal>WITH HOLD</literal>).
+        portal: <literal>1</literal> (<literal>WITH HOLD</literal>),
+        <literal>2</literal> (<literal>SCROLL</literal>) and
+        <literal>4</literal> (<literal>NO SCROLL</literal>).
       </entry>
       </row>
      </tbody>
@@ -1097,7 +1099,7 @@ SELCT 1/0;<!-- this typo is intentional -->
     by the query; the format can be specified overall, or per-column.
     If the <literal>_pq_.protocol_cursor</literal> protocol option is enabled,
     Bind can optionally include cursor options to control portal behavior,
-    such as creating holdable cursors.
+    such as creating scrollable or holdable cursors.
     The response is either BindComplete or ErrorResponse.
    </para>
 
@@ -4416,14 +4418,18 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
          Cursor options for the portal, present only when the
          <literal>_pq_.protocol_cursor</literal> protocol extension has been
          negotiated.  The value is a bitmap:
-         <literal>1</literal> (<literal>WITH HOLD</literal>); other bits are
-         reserved and must be zero.  A value of <literal>0</literal> is
-         equivalent to omitting the field.
+         <literal>1</literal> (<literal>WITH HOLD</literal>),
+         <literal>2</literal> (<literal>SCROLL</literal>) and
+         <literal>4</literal> (<literal>NO SCROLL</literal>); other bits are
+         reserved and must be zero.  <literal>SCROLL</literal> and
+         <literal>NO SCROLL</literal> must not both be set.  A value of
+         <literal>0</literal> is equivalent to omitting the field.
         </para>
         <para>
-         <literal>WITH HOLD</literal> requires the prepared statement to be a
-         single <command>SELECT</command> without a row-locking clause, the
-         same restrictions <xref linkend="sql-declare"/> imposes.
+         <literal>SCROLL</literal> and <literal>WITH HOLD</literal> require the
+         prepared statement to be a single <command>SELECT</command> without a
+         row-locking clause, the same restrictions
+         <xref linkend="sql-declare"/> imposes.
         </para>
        </listitem>
       </varlistentry>

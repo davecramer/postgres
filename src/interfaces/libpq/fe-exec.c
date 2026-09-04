@@ -1742,6 +1742,14 @@ PQsendBindWithCursorOptions(PGconn *conn,
 		return 0;
 	}
 
+	if ((cursorOptions & PQ_BIND_CURSOR_SCROLL) &&
+		(cursorOptions & PQ_BIND_CURSOR_NO_SCROLL))
+	{
+		libpq_append_conn_error(conn,
+								"cannot specify both PQ_BIND_CURSOR_SCROLL and PQ_BIND_CURSOR_NO_SCROLL");
+		return 0;
+	}
+
 	entry = pqAllocCmdQueueEntry(conn);
 	if (entry == NULL)
 		return 0;
