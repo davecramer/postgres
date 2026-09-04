@@ -69,6 +69,10 @@ extern "C"
 /* Indicates presence of the PQAUTHDATA_OAUTH_BEARER_TOKEN_V2 authdata hook */
 #define LIBPQ_HAS_OAUTH_BEARER_TOKEN_V2 1
 
+/* Features added in PostgreSQL v20: */
+/* Indicates presence of the _pq_.protocol_cursor support functions */
+#define LIBPQ_HAS_PROTOCOL_CURSOR 1
+
 /*
  * Bind message extension flags.  These flags are sent in the optional
  * extension bitmap field of the Bind message when a protocol extension
@@ -82,6 +86,26 @@ extern "C"
 #define PQ_BIND_CURSOR_VALID_FLAGS	(PQ_BIND_CURSOR_HOLD | \
 									 PQ_BIND_CURSOR_SCROLL | \
 									 PQ_BIND_CURSOR_NO_SCROLL)
+
+/*
+ * Fetch directions for PQsendExecutePortal and PQsendQueryScrollable.  These
+ * are sent in the optional fetch trailer of the Execute message when the
+ * _pq_.protocol_cursor extension is negotiated, and have the same meanings as
+ * the identically named directions of the SQL FETCH command.
+ */
+#define PQ_FETCH_FORWARD			0
+#define PQ_FETCH_BACKWARD			1
+#define PQ_FETCH_ABSOLUTE			2
+#define PQ_FETCH_RELATIVE			3
+
+/*
+ * Portable spelling of "all remaining rows" for the fetch count of
+ * PQsendExecutePortal and PQsendQueryScrollable, equivalent to FETCH ALL and
+ * FETCH BACKWARD ALL.  It is only meaningful with PQ_FETCH_FORWARD and
+ * PQ_FETCH_BACKWARD; with the other directions it is simply a row position
+ * beyond the end of any result set.
+ */
+#define PQ_FETCH_ALL				INT64_MAX
 
 /*
  * Option flags for PQcopyResult
@@ -560,6 +584,13 @@ extern int	PQsendBindWithCursorOptions(PGconn *conn, const char *stmtName,
 										int nParams, const char *const *paramValues,
 										const int *paramLengths, const int *paramFormats,
 										int resultFormat, const char *portalName, int cursorOptions);
+extern int	PQsendExecutePortal(PGconn *conn, const char *portalName,
+								int direction, int64_t count);
+extern int	PQsendQueryScrollable(PGconn *conn, const char *stmtName,
+								  int nParams, const char *const *paramValues,
+								  const int *paramLengths, const int *paramFormats,
+								  int resultFormat, const char *portalName,
+								  int cursorOptions, int direction, int64_t count);
 extern int	PQPortalCursorEnabled(const PGconn *conn);
 extern int	PQsetSingleRowMode(PGconn *conn);
 extern int	PQsetChunkedRowsMode(PGconn *conn, int chunkSize);

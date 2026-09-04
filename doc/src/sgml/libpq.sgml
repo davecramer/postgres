@@ -2240,7 +2240,10 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
        <para>
         Requests the <literal>_pq_.protocol_cursor</literal> protocol extension,
         which allows cursor options to be attached to a named portal with
-        <xref linkend="libpq-PQsendBindWithCursorOptions"/>.  Set this to
+        <xref linkend="libpq-PQsendBindWithCursorOptions"/>, and that portal to
+        be fetched from in either direction with
+        <xref linkend="libpq-PQsendExecutePortal"/> and
+        <xref linkend="libpq-PQsendQueryScrollable"/>.  Set this to
         <literal>1</literal> to request the extension; the default is
         <literal>0</literal>.  The extension does not require a particular
         minor protocol version, so it does not change the version requested by
@@ -2252,7 +2255,10 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
         server rejects it, the connection still succeeds and
         <xref linkend="libpq-PQPortalCursorEnabled"/> returns false; calls to
         <xref linkend="libpq-PQsendBindWithCursorOptions"/> with non-zero cursor
-        options then fail without contacting the server.
+        options, and all calls to
+        <xref linkend="libpq-PQsendExecutePortal"/> and
+        <xref linkend="libpq-PQsendQueryScrollable"/>, then fail without
+        contacting the server.
        </para>
       </listitem>
      </varlistentry>
@@ -3177,8 +3183,11 @@ int PQPortalCursorEnabled(const PGconn *conn);
       <para>
        When this returns true, <xref linkend="libpq-PQsendBindWithCursorOptions"/>
        can be used with non-zero cursor options to create scrollable or
-       holdable portals.  Applications can use this function to implement
-       graceful fallback logic when the server does not support the extension.
+       holdable portals, and <xref linkend="libpq-PQsendExecutePortal"/> and
+       <xref linkend="libpq-PQsendQueryScrollable"/> can be used to fetch from
+       such a portal in either direction.  Applications can use this function
+       to implement graceful fallback logic when the server does not support
+       the extension.
       </para>
      </listitem>
     </varlistentry>
@@ -5377,8 +5386,10 @@ unsigned char *PQunescapeBytea(const unsigned char *from, size_t *to_length);
    <xref linkend="libpq-PQsendDescribePrepared"/>,
    <xref linkend="libpq-PQsendDescribePortal"/>,
    <xref linkend="libpq-PQsendClosePrepared"/>,
-   <xref linkend="libpq-PQsendClosePortal"/>, and
+   <xref linkend="libpq-PQsendClosePortal"/>,
    <xref linkend="libpq-PQsendBindWithCursorOptions"/>,
+   <xref linkend="libpq-PQsendExecutePortal"/>, and
+   <xref linkend="libpq-PQsendQueryScrollable"/>,
    which can be used with <xref linkend="libpq-PQgetResult"/> to duplicate
    the functionality of
    <xref linkend="libpq-PQexecParams"/>,
@@ -5635,7 +5646,8 @@ int PQsendBindWithCursorOptions(PGconn *conn,
        between 0 and 65535.  The function sends a Bind message
        to create the portal but does not execute it.  The portal can
        later be operated on with cursor commands such as FETCH, MOVE,
-       and CLOSE.
+       and CLOSE, or fetched from with
+       <xref linkend="libpq-PQsendExecutePortal"/>.
        Returns 1 on success, 0 on failure.
       </para>
 
@@ -5649,6 +5661,138 @@ int PQsendBindWithCursorOptions(PGconn *conn,
        returns 0.  Passing <literal>cursorOptions</literal> as 0 is
        always permitted and creates a named portal without any cursor
        options, regardless of whether the extension was negotiated.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry id="libpq-PQsendExecutePortal">
+     <term><function>PQsendExecutePortal</function><indexterm><primary>PQsendExecutePortal</primary></indexterm></term>
+
+     <listitem>
+      <para>
+       Fetches rows from an existing named portal, in the given direction,
+       without waiting for the result(s).
+<synopsis>
+int PQsendExecutePortal(PGconn *conn,
+                        const char *portalName,
+                        int direction,
+                        int64_t count);
+</synopsis>
+      </para>
+
+      <para>
+       The <literal>direction</literal> parameter is one of
+       <literal>PQ_FETCH_FORWARD</literal>,
+       <literal>PQ_FETCH_BACKWARD</literal>,
+       <literal>PQ_FETCH_ABSOLUTE</literal> or
+       <literal>PQ_FETCH_RELATIVE</literal>, and <literal>count</literal> is
+       interpreted exactly as the <xref linkend="sql-fetch"/> command of the
+       same direction interprets it.  Passing
+       <literal>PQ_FETCH_ALL</literal> as the count of a
+       <literal>PQ_FETCH_FORWARD</literal> or
+       <literal>PQ_FETCH_BACKWARD</literal> fetch requests all remaining rows
+       in that direction, as <command>FETCH ALL</command> and
+       <command>FETCH BACKWARD ALL</command> do; it is a portable spelling of
+       that request.  With the other two directions
+       <literal>PQ_FETCH_ALL</literal> is merely a row position beyond the end
+       of any result set.  A count of zero re-fetches the row the portal is
+       positioned on, without moving it; unlike the row limit of a plain
+       Execute message, it does not mean <quote>all rows</quote>.
+      </para>
+
+      <para>
+       Fetching backwards, or by absolute position, requires a portal that can
+       be scanned backwards, either because it was created with the
+       <literal>PQ_BIND_CURSOR_SCROLL</literal> cursor option or because the
+       server found its plan to be scrollable anyway; the rules are the same as
+       for a cursor created by <xref linkend="sql-declare"/>.
+      </para>
+
+      <para>
+       <literal>portalName</literal> must be a non-empty string; the unnamed
+       portal cannot be fetched from this way.  The portal must still exist, so
+       either this call and the command that created the portal must both be
+       inside the same transaction block, or the portal must have been created
+       with <literal>PQ_BIND_CURSOR_HOLD</literal>, or both commands must be
+       sent in the same pipeline.  A portal created by an
+       <acronym>SQL</acronym> <xref linkend="sql-declare"/> command can also be
+       used.
+      </para>
+
+      <para>
+       1 is returned if the command was successfully dispatched and 0 if not
+       (in which case, use <xref linkend="libpq-PQerrorMessage"/> to get more
+       information about the failure).  On success, call
+       <xref linkend="libpq-PQgetResult"/> one or more times to obtain the
+       results: the fetched rows arrive as a single
+       <literal>PGRES_TUPLES_OK</literal> result, just as for
+       <xref linkend="libpq-PQsendQueryParams"/>, and its command status is
+       that of the portal's own query rather than
+       <literal>FETCH</literal>.
+      </para>
+
+      <para>
+       This function always requires the
+       <literal>_pq_.protocol_cursor</literal> protocol extension to have been
+       negotiated during connection startup, which is requested by setting the
+       <xref linkend="libpq-connect-protocol_cursor"/> connection parameter to
+       <literal>1</literal> and can be checked with
+       <xref linkend="libpq-PQPortalCursorEnabled"/>.  If the extension was not
+       negotiated, the function returns 0 without contacting the server.
+      </para>
+
+      <para>
+       In pipeline mode, this function works normally.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry id="libpq-PQsendQueryScrollable">
+     <term><function>PQsendQueryScrollable</function><indexterm><primary>PQsendQueryScrollable</primary></indexterm></term>
+
+     <listitem>
+      <para>
+       Creates a named portal from a previously prepared statement, with the
+       specified cursor options applied, and fetches from it, in a single
+       command.
+<synopsis>
+int PQsendQueryScrollable(PGconn *conn,
+                          const char *stmtName,
+                          int nParams,
+                          const char *const *paramValues,
+                          const int *paramLengths,
+                          const int *paramFormats,
+                          int resultFormat,
+                          const char *portalName,
+                          int cursorOptions,
+                          int direction,
+                          int64_t count);
+</synopsis>
+      </para>
+
+      <para>
+       The first nine parameters are handled identically to
+       <xref linkend="libpq-PQsendBindWithCursorOptions"/>, and
+       <literal>direction</literal> and <literal>count</literal> identically to
+       <xref linkend="libpq-PQsendExecutePortal"/>.  The effect is that of
+       those two functions in succession, except that everything is sent as a
+       single command and therefore produces a single
+       <literal>PGRES_TUPLES_OK</literal> result rather than two rounds of
+       results.  The portal remains in existence afterwards and can be fetched
+       from again with <xref linkend="libpq-PQsendExecutePortal"/>, subject to
+       the portal lifetime rules described there.
+      </para>
+
+      <para>
+       Because a fetch direction is always sent, this function requires the
+       <literal>_pq_.protocol_cursor</literal> protocol extension even when
+       <literal>cursorOptions</literal> is zero; if the extension was not
+       negotiated it returns 0 without contacting the server.  Returns 1 on
+       success, 0 on failure.
+      </para>
+
+      <para>
+       In pipeline mode, this function works normally.
       </para>
      </listitem>
     </varlistentry>
@@ -5668,6 +5812,8 @@ int PQsendBindWithCursorOptions(PGconn *conn,
        <xref linkend="libpq-PQsendClosePrepared"/>,
        <xref linkend="libpq-PQsendClosePortal"/>,
        <xref linkend="libpq-PQsendBindWithCursorOptions"/>,
+       <xref linkend="libpq-PQsendExecutePortal"/>,
+       <xref linkend="libpq-PQsendQueryScrollable"/>,
        <xref linkend="libpq-PQsendPipelineSync"/>, or
        <xref linkend="libpq-PQpipelineSync"/>
        call, and returns it.
@@ -6045,8 +6191,10 @@ int PQflush(PGconn *conn);
      <xref linkend="libpq-PQsendDescribePrepared"/>,
      <xref linkend="libpq-PQsendDescribePortal"/>,
      <xref linkend="libpq-PQsendClosePrepared"/>,
-     <xref linkend="libpq-PQsendClosePortal"/>, and
-     <xref linkend="libpq-PQsendBindWithCursorOptions"/> also work in pipeline mode.
+     <xref linkend="libpq-PQsendClosePortal"/>,
+     <xref linkend="libpq-PQsendBindWithCursorOptions"/>,
+     <xref linkend="libpq-PQsendExecutePortal"/>, and
+     <xref linkend="libpq-PQsendQueryScrollable"/> also work in pipeline mode.
      Result processing is described below.
     </para>
 
