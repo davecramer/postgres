@@ -335,9 +335,14 @@
 
      <tbody>
       <row>
-       <entry namest="last" align="center" valign="middle">
-        <emphasis>(No supported protocol extensions are currently defined.)</emphasis>
-       </entry>
+      <entry><literal>_pq_.protocol_cursor</literal></entry>
+      <entry><literal>true</literal></entry>
+      <entry>PostgreSQL 20 and later</entry>
+      <entry>Enables cursor options in the Bind message.
+        When set to <literal>true</literal>, the Bind message includes
+        an optional bitmap field carrying the cursor options for the
+        portal: <literal>1</literal> (<literal>WITH HOLD</literal>).
+      </entry>
       </row>
      </tbody>
     </tgroup>
@@ -1090,6 +1095,9 @@ SELCT 1/0;<!-- this typo is intentional -->
     pass NULL values for them in the Bind message.)
     Bind also specifies the format to use for any data returned
     by the query; the format can be specified overall, or per-column.
+    If the <literal>_pq_.protocol_cursor</literal> protocol option is enabled,
+    Bind can optionally include cursor options to control portal behavior,
+    such as creating holdable cursors.
     The response is either BindComplete or ErrorResponse.
    </para>
 
@@ -4397,6 +4405,25 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
         <para>
          The result-column format codes.  Each must presently be
          zero (text) or one (binary).
+        </para>
+       </listitem>
+      </varlistentry>
+
+      <varlistentry>
+       <term>Int32 (optional)</term>
+       <listitem>
+        <para>
+         Cursor options for the portal, present only when the
+         <literal>_pq_.protocol_cursor</literal> protocol extension has been
+         negotiated.  The value is a bitmap:
+         <literal>1</literal> (<literal>WITH HOLD</literal>); other bits are
+         reserved and must be zero.  A value of <literal>0</literal> is
+         equivalent to omitting the field.
+        </para>
+        <para>
+         <literal>WITH HOLD</literal> requires the prepared statement to be a
+         single <command>SELECT</command> without a row-locking clause, the
+         same restrictions <xref linkend="sql-declare"/> imposes.
         </para>
        </listitem>
       </varlistentry>

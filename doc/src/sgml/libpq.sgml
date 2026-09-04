@@ -2234,6 +2234,29 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
       </listitem>
      </varlistentry>
 
+     <varlistentry id="libpq-connect-protocol_cursor" xreflabel="protocol_cursor">
+      <term><literal>protocol_cursor</literal></term>
+      <listitem>
+       <para>
+        Requests the <literal>_pq_.protocol_cursor</literal> protocol extension,
+        which allows cursor options to be attached to a named portal with
+        <xref linkend="libpq-PQsendBindWithCursorOptions"/>.  Set this to
+        <literal>1</literal> to request the extension; the default is
+        <literal>0</literal>.  The extension does not require a particular
+        minor protocol version, so it does not change the version requested by
+        <xref linkend="libpq-connect-max-protocol-version"/>.
+       </para>
+
+       <para>
+        The extension is only usable if the server also supports it.  If the
+        server rejects it, the connection still succeeds and
+        <xref linkend="libpq-PQPortalCursorEnabled"/> returns false; calls to
+        <xref linkend="libpq-PQsendBindWithCursorOptions"/> with non-zero cursor
+        options then fail without contacting the server.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="libpq-connect-krbsrvname" xreflabel="krbsrvname">
       <term><literal>krbsrvname</literal></term>
       <listitem>
@@ -3134,6 +3157,28 @@ int PQconnectionUsedGSSAPI(const PGconn *conn);
       <para>
        This function can be applied to detect whether the connection was
        authenticated with GSSAPI.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry id="libpq-PQPortalCursorEnabled">
+     <term><function>PQPortalCursorEnabled</function><indexterm><primary>PQPortalCursorEnabled</primary></indexterm></term>
+     <listitem>
+      <para>
+       Returns true (1) if the connection has successfully negotiated
+       the <literal>_pq_.protocol_cursor</literal> protocol extension,
+       false (0) if not.
+
+<synopsis>
+int PQPortalCursorEnabled(const PGconn *conn);
+</synopsis>
+      </para>
+
+      <para>
+       When this returns true, <xref linkend="libpq-PQsendBindWithCursorOptions"/>
+       can be used with non-zero cursor options to create holdable portals.
+       Applications can use this function to implement graceful fallback logic
+       when the server does not support the extension.
       </para>
      </listitem>
     </varlistentry>
@@ -5331,8 +5376,9 @@ unsigned char *PQunescapeBytea(const unsigned char *from, size_t *to_length);
    <xref linkend="libpq-PQsendQueryPrepared"/>,
    <xref linkend="libpq-PQsendDescribePrepared"/>,
    <xref linkend="libpq-PQsendDescribePortal"/>,
-   <xref linkend="libpq-PQsendClosePrepared"/>, and
-   <xref linkend="libpq-PQsendClosePortal"/>,
+   <xref linkend="libpq-PQsendClosePrepared"/>,
+   <xref linkend="libpq-PQsendClosePortal"/>, and
+   <xref linkend="libpq-PQsendBindWithCursorOptions"/>,
    which can be used with <xref linkend="libpq-PQgetResult"/> to duplicate
    the functionality of
    <xref linkend="libpq-PQexecParams"/>,
@@ -5530,6 +5576,66 @@ int PQsendClosePortal(PGconn *conn, const char *portalName);
      </listitem>
     </varlistentry>
 
+    <varlistentry id="libpq-PQsendBindWithCursorOptions">
+     <term><function>PQsendBindWithCursorOptions</function><indexterm><primary>PQsendBindWithCursorOptions</primary></indexterm></term>
+
+     <listitem>
+      <para>
+       Creates a named portal from a previously prepared statement, with
+       the specified cursor options applied.
+<synopsis>
+int PQsendBindWithCursorOptions(PGconn *conn,
+                                const char *stmtName,
+                                int nParams,
+                                const char *const *paramValues,
+                                const int *paramLengths,
+                                const int *paramFormats,
+                                int resultFormat,
+                                const char *portalName,
+                                int cursorOptions);
+</synopsis>
+      </para>
+
+      <para>
+       The <literal>cursorOptions</literal> parameter is a bitmask of
+       cursor option flags.  At present the only flag is
+       <literal>PQ_BIND_CURSOR_HOLD</literal>, which corresponds to the
+       <literal>WITH HOLD</literal> option of
+       <xref linkend="sql-declare"/>.  No other bits may be set.
+      </para>
+
+      <para>
+       <literal>PQ_BIND_CURSOR_HOLD</literal> requires the prepared statement
+       to be a single <command>SELECT</command> without a row-locking clause,
+       the same restrictions <xref linkend="sql-declare"/> imposes.  For any
+       other statement the server reports an error rather than silently
+       ignoring the options.
+      </para>
+
+      <para>
+       The <literal>portalName</literal> must be a non-empty string;
+       unnamed portals are rejected.  <literal>nParams</literal> must be
+       between 0 and 65535.  The function sends a Bind message
+       to create the portal but does not execute it.  The portal can
+       later be operated on with cursor commands such as FETCH, MOVE,
+       and CLOSE.
+       Returns 1 on success, 0 on failure.
+      </para>
+
+      <para>
+       The <literal>_pq_.protocol_cursor</literal> protocol extension must have
+       been successfully negotiated during connection startup for cursor
+       options to take effect.  This is enabled by setting the
+       <xref linkend="libpq-connect-protocol_cursor"/> connection parameter to
+       <literal>1</literal>.  If the extension was not negotiated and
+       <literal>cursorOptions</literal> is non-zero, the function
+       returns 0.  Passing <literal>cursorOptions</literal> as 0 is
+       always permitted and creates a named portal without any cursor
+       options, regardless of whether the extension was negotiated.
+      </para>
+     </listitem>
+    </varlistentry>
+
     <varlistentry id="libpq-PQgetResult">
      <term><function>PQgetResult</function><indexterm><primary>PQgetResult</primary></indexterm></term>
 
@@ -5544,6 +5650,7 @@ int PQsendClosePortal(PGconn *conn, const char *portalName);
        <xref linkend="libpq-PQsendDescribePortal"/>,
        <xref linkend="libpq-PQsendClosePrepared"/>,
        <xref linkend="libpq-PQsendClosePortal"/>,
+       <xref linkend="libpq-PQsendBindWithCursorOptions"/>,
        <xref linkend="libpq-PQsendPipelineSync"/>, or
        <xref linkend="libpq-PQpipelineSync"/>
        call, and returns it.
@@ -5920,8 +6027,9 @@ int PQflush(PGconn *conn);
      The functions <xref linkend="libpq-PQsendPrepare"/>,
      <xref linkend="libpq-PQsendDescribePrepared"/>,
      <xref linkend="libpq-PQsendDescribePortal"/>,
-     <xref linkend="libpq-PQsendClosePrepared"/>, and
-     <xref linkend="libpq-PQsendClosePortal"/> also work in pipeline mode.
+     <xref linkend="libpq-PQsendClosePrepared"/>,
+     <xref linkend="libpq-PQsendClosePortal"/>, and
+     <xref linkend="libpq-PQsendBindWithCursorOptions"/> also work in pipeline mode.
      Result processing is described below.
     </para>
 
